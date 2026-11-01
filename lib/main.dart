@@ -1,0 +1,1880 @@
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:intl/intl.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+import 'models/task_habit_model.dart';
+import 'services/day_transition_service.dart';
+import 'services/notification_service.dart';
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  DayTransitionService.instance.init();
+  await NotificationService.instance.init();
+  runApp(const TaskHabitApp());
+}
+
+class TaskHabitApp extends StatelessWidget {
+  const TaskHabitApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'Task & Habit Tracker',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: const Color(0xFF6750A4),
+          brightness: Brightness.light,
+        ),
+        useMaterial3: true,
+      ),
+      home: const HomeScreen(title: 'Hôm Nay Của Tôi'),
+    );
+  }
+}
+
+/// Helper an toàn chuyển đổi đường dẫn (URL mạng, data base64 URI, hoặc file cục bộ) thành ImageProvider
+ImageProvider getCustomImageProvider(String pathOrUrl) {
+  final trimmed = pathOrUrl.trim();
+  if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
+    return NetworkImage(trimmed);
+  } else if (trimmed.startsWith('data:image') ||
+      trimmed.startsWith('data:application')) {
+    try {
+      final base64Content = trimmed.split(',').last;
+      return MemoryImage(base64Decode(base64Content));
+    } catch (_) {
+      return NetworkImage(trimmed);
+    }
+  } else if (kIsWeb) {
+    return NetworkImage(trimmed);
+  } else {
+    return FileImage(File(trimmed));
+  }
+}
+
+class HomeScreen extends StatefulWidget {
+  const HomeScreen({super.key, required this.title});
+
+  final String title;
+
+  @override
+  State<HomeScreen> createState() => _HomeScreenState();
+}
+
+class _HomeScreenState extends State<HomeScreen> {
+  DateTime _selectedDate = DateTime.now();
+  List<Task> _tasks = [];
+  List<Habit> _habits = [];
+
+  // Tab: 0 = Cần làm, 1 = Đã hoàn thành
+  int _currentTabIndex = 0;
+  Tag? _selectedFilterTag;
+
+  List<Tag> _availableTags = [
+    Tag(id: 't1', name: 'Gaming (Dragons)', colorValue: 0xFFFF5722),
+    Tag(id: 't2', name: 'Thể thao', colorValue: 0xFF4CAF50),
+    Tag(id: 't3', name: 'Công việc', colorValue: 0xFF2196F3),
+    Tag(id: 't4', name: 'Học tập', colorValue: 0xFFFF9800),
+  ];
+
+  // Kho thư viện hình nền động & tĩnh có sẵn
+  List<BackgroundItem> _bgLibrary = [];
+
+  final List<BackgroundItem> _defaultBgLibrary = [
+    BackgroundItem(
+      id: 'bg1',
+      title: 'Rồng Thần Chiến Binh',
+      category: 'Game',
+      urlOrPath:
+          'https://images.unsplash.com/photo-1579783900882-c0d3dad7b119?w=800',
+    ),
+    BackgroundItem(
+      id: 'bg2',
+      title: 'Thành Phố Cyberpunk',
+      category: 'Game',
+      urlOrPath:
+          'https://images.unsplash.com/photo-1542751371-adc38448a05e?w=800',
+    ),
+    BackgroundItem(
+      id: 'bg3',
+      title: 'Sân Cỏ Sôi Động',
+      category: 'Thể thao',
+      urlOrPath:
+          'https://images.unsplash.com/photo-1508098682722-e99c43a406b2?w=800',
+    ),
+    BackgroundItem(
+      id: 'bg4',
+      title: 'Nhịp Điệu Thể Thao',
+      category: 'Thể thao',
+      urlOrPath:
+          'https://images.unsplash.com/photo-1517466787929-bc90951d0974?w=800',
+    ),
+    BackgroundItem(
+      id: 'bg5',
+      title: 'Đêm Sao Tĩnh Lặng',
+      category: 'Học tập',
+      urlOrPath:
+          'https://images.unsplash.com/photo-1518709268805-4e9042af9f23?w=800',
+    ),
+    BackgroundItem(
+      id: 'bg6',
+      title: 'Cực Quang Huyền Diệu',
+      category: 'Chill',
+      urlOrPath:
+          'https://images.unsplash.com/photo-1531366936337-7c912a4589a7?w=800',
+    ),
+  ];
+
+  bool _isLoading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadDataFromPrefs();
+    DayTransitionService.instance.init(
+      onNewDay: () {
+        if (mounted) _loadDataFromPrefs();
+      },
+    );
+  }
+
+  Future<void> _loadDataFromPrefs() async {
+    final prefs = await SharedPreferences.getInstance();
+
+    final String? tasksString = prefs.getString('saved_tasks');
+    if (tasksString != null) {
+      _tasks = (jsonDecode(tasksString) as List)
+          .map((item) => Task.fromMap(item))
+          .toList();
+    } else {
+      _tasks = [
+        Task(
+          id: '1',
+          title: 'Săn Behemoth & Mở cổng 4',
+          dueDate: DateTime.now(),
+          reminderTime: '20:00',
+          tags: [_availableTags[0]],
+          themeType: 'game',
+        ),
+      ];
+    }
+
+    final String? habitsString = prefs.getString('saved_habits');
+    if (habitsString != null) {
+      _habits = (jsonDecode(habitsString) as List)
+          .map((item) => Habit.fromMap(item))
+          .toList();
+    } else {
+      _habits = [
+        Habit(
+          id: 'h1',
+          title: 'Đánh cầu lông 30 phút',
+          streak: 3,
+          reminderTime: '17:30',
+          tags: [_availableTags[1]],
+          themeType: 'sport',
+        ),
+      ];
+    }
+
+    final String? tagsString = prefs.getString('saved_tags');
+    if (tagsString != null) {
+      _availableTags = (jsonDecode(tagsString) as List)
+          .map((item) => Tag.fromMap(item))
+          .toList();
+    }
+
+    final String? bgString = prefs.getString('saved_bg_library');
+    if (bgString != null) {
+      final List decoded = jsonDecode(bgString);
+      _bgLibrary = decoded.map((item) => BackgroundItem.fromMap(item)).toList();
+    } else {
+      _bgLibrary = List.from(_defaultBgLibrary);
+    }
+
+    setState(() {
+      _isLoading = false;
+    });
+  }
+
+  Future<void> _saveDataToPrefs() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(
+      'saved_tasks',
+      jsonEncode(_tasks.map((t) => t.toMap()).toList()),
+    );
+    await prefs.setString(
+      'saved_habits',
+      jsonEncode(_habits.map((h) => h.toMap()).toList()),
+    );
+    await prefs.setString(
+      'saved_tags',
+      jsonEncode(_availableTags.map((t) => t.toMap()).toList()),
+    );
+    await prefs.setString(
+      'saved_bg_library',
+      jsonEncode(_bgLibrary.map((b) => b.toMap()).toList()),
+    );
+  }
+
+  /// Tải ảnh cục bộ từ thiết bị qua image_picker (hỗ trợ cả Web & Mobile)
+  Future<void> _pickImageFromDevice(Function(String) onImagePicked) async {
+    try {
+      final picker = ImagePicker();
+      final pickedFile = await picker.pickImage(
+        source: ImageSource.gallery,
+        maxWidth: 1600,
+        maxHeight: 1600,
+        imageQuality: 85,
+      );
+      if (pickedFile != null) {
+        if (kIsWeb) {
+          final bytes = await pickedFile.readAsBytes();
+          final base64String = 'data:image/png;base64,${base64Encode(bytes)}';
+          onImagePicked(base64String);
+        } else {
+          onImagePicked(pickedFile.path);
+        }
+      }
+    } catch (e) {
+      debugPrint('Lỗi chọn ảnh từ thiết bị: $e');
+    }
+  }
+
+  /// Hộp thoại tạo nhãn dán tùy chỉnh
+  void _showCreateTagDialog(Function(Tag) onTagCreated) {
+    String tagName = '';
+    int selectedColor = 0xFF9C27B0;
+    final List<int> colorOptions = [
+      0xFFE91E63,
+      0xFF9C27B0,
+      0xFF3F51B5,
+      0xFF2196F3,
+      0xFF4CAF50,
+      0xFFFF9800,
+      0xFF009688,
+      0xFF795548,
+    ];
+
+    showDialog(
+      context: context,
+      builder: (context) {
+        return StatefulBuilder(
+          builder: (context, setStateColor) {
+            return AlertDialog(
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(20),
+              ),
+              title: const Text(
+                'Tạo nhãn dán mới',
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+              ),
+              content: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  TextField(
+                    autofocus: true,
+                    onChanged: (val) => tagName = val,
+                    decoration: InputDecoration(
+                      hintText: 'Tên nhãn (VD: Dự án, Sức khỏe...)',
+                      filled: true,
+                      fillColor: Colors.grey.shade50,
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(12),
+                        borderSide: BorderSide.none,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: colorOptions.map((color) {
+                      return GestureDetector(
+                        onTap: () => setStateColor(() => selectedColor = color),
+                        child: Container(
+                          width: 34,
+                          height: 34,
+                          decoration: BoxDecoration(
+                            color: Color(color),
+                            shape: BoxShape.circle,
+                            border: selectedColor == color
+                                ? Border.all(color: Colors.black, width: 2.5)
+                                : null,
+                          ),
+                          child: selectedColor == color
+                              ? const Icon(
+                                  Icons.check,
+                                  size: 16,
+                                  color: Colors.white,
+                                )
+                              : null,
+                        ),
+                      );
+                    }).toList(),
+                  ),
+                ],
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(context),
+                  child: const Text('Hủy'),
+                ),
+                ElevatedButton(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.deepPurple,
+                    foregroundColor: Colors.white,
+                  ),
+                  onPressed: () {
+                    if (tagName.trim().isNotEmpty) {
+                      final newTag = Tag(
+                        id: DateTime.now().millisecondsSinceEpoch.toString(),
+                        name: tagName.trim(),
+                        colorValue: selectedColor,
+                      );
+                      setState(() => _availableTags.add(newTag));
+                      _saveDataToPrefs();
+                      onTagCreated(newTag);
+                      Navigator.pop(context);
+                    }
+                  },
+                  child: const Text('Thêm'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+  }
+
+  /// Modal chọn hình nền từ kho thư viện Background Library
+  void _showBackgroundLibrarySheet(Function(String) onSelect) {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.white,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      builder: (sheetContext) {
+        return StatefulBuilder(
+          builder: (context, setStateSheet) {
+            return DraggableScrollableSheet(
+              initialChildSize: 0.72,
+              minChildSize: 0.45,
+              maxChildSize: 0.92,
+              expand: false,
+              builder: (context, scrollController) {
+                return Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 16.0),
+                  child: Column(
+                    children: [
+                      const SizedBox(height: 12),
+                      Container(
+                        width: 40,
+                        height: 4,
+                        decoration: BoxDecoration(
+                          color: Colors.grey.shade300,
+                          borderRadius: BorderRadius.circular(2),
+                        ),
+                      ),
+                      const SizedBox(height: 14),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          const Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  'Kho Thư Viện Background',
+                                  style: TextStyle(
+                                    fontSize: 16,
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                                SizedBox(height: 2),
+                                Text(
+                                  'Chọn hình nền cho Card của bạn',
+                                  style: TextStyle(
+                                    fontSize: 11,
+                                    color: Colors.grey,
+                                  ),
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ],
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          ElevatedButton.icon(
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: Colors.deepPurple,
+                              foregroundColor: Colors.white,
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 10,
+                                vertical: 6,
+                              ),
+                              textStyle: const TextStyle(fontSize: 11),
+                            ),
+                            icon: const Icon(Icons.add_photo_alternate,
+                                size: 15),
+                            label: const Text('Thêm vào kho'),
+                            onPressed: () {
+                              _showAddBackgroundToLibraryDialog(() {
+                                setStateSheet(() {});
+                                setState(() {});
+                              });
+                            },
+                          ),
+                        ],
+                      ),
+                      const Divider(height: 24),
+                      Expanded(
+                        child: GridView.builder(
+                          controller: scrollController,
+                          itemCount: _bgLibrary.length,
+                          gridDelegate:
+                              const SliverGridDelegateWithFixedCrossAxisCount(
+                            crossAxisCount: 2,
+                            childAspectRatio: 1.35,
+                            crossAxisSpacing: 10,
+                            mainAxisSpacing: 10,
+                          ),
+                          itemBuilder: (context, index) {
+                            final bgItem = _bgLibrary[index];
+                            final isCustom = !_defaultBgLibrary
+                                .any((item) => item.id == bgItem.id);
+
+                            return InkWell(
+                              borderRadius: BorderRadius.circular(16),
+                              onTap: () {
+                                onSelect(bgItem.urlOrPath);
+                                Navigator.pop(sheetContext);
+                              },
+                              child: ClipRRect(
+                                borderRadius: BorderRadius.circular(16),
+                                child: Stack(
+                                  fit: StackFit.expand,
+                                  children: [
+                                    Container(
+                                      color: const Color(0xFF1E1E2C),
+                                      child: Image(
+                                        image: getCustomImageProvider(
+                                          bgItem.urlOrPath,
+                                        ),
+                                        fit: BoxFit.cover,
+                                        errorBuilder: (context, error, stackTrace) =>
+                                            const Center(
+                                          child: Icon(
+                                            Icons.broken_image,
+                                            color: Colors.white54,
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                    Container(
+                                      decoration: BoxDecoration(
+                                        gradient: LinearGradient(
+                                          begin: Alignment.topCenter,
+                                          end: Alignment.bottomCenter,
+                                          colors: [
+                                            Colors.transparent,
+                                            Colors.black.withValues(alpha: 0.75),
+                                          ],
+                                        ),
+                                      ),
+                                    ),
+                                    Positioned(
+                                      top: 6,
+                                      left: 6,
+                                      child: Container(
+                                        padding: const EdgeInsets.symmetric(
+                                          horizontal: 6,
+                                          vertical: 2,
+                                        ),
+                                        decoration: BoxDecoration(
+                                          color: Colors.black.withValues(alpha: 0.6),
+                                          borderRadius:
+                                              BorderRadius.circular(6),
+                                        ),
+                                        child: Text(
+                                          bgItem.category,
+                                          style: const TextStyle(
+                                            color: Colors.amberAccent,
+                                            fontSize: 9,
+                                            fontWeight: FontWeight.bold,
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                    if (isCustom)
+                                      Positioned(
+                                        top: 2,
+                                        right: 2,
+                                        child: IconButton(
+                                          icon: const Icon(
+                                            Icons.delete,
+                                            color: Colors.redAccent,
+                                            size: 18,
+                                          ),
+                                          onPressed: () {
+                                            setStateSheet(() {
+                                              _bgLibrary.removeAt(index);
+                                            });
+                                            setState(() {});
+                                            _saveDataToPrefs();
+                                          },
+                                        ),
+                                      ),
+                                    Positioned(
+                                      bottom: 8,
+                                      left: 8,
+                                      right: 8,
+                                      child: Text(
+                                        bgItem.title,
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: const TextStyle(
+                                          color: Colors.white,
+                                          fontWeight: FontWeight.bold,
+                                          fontSize: 12,
+                                        ),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            );
+                          },
+                        ),
+                      ),
+                    ],
+                  ),
+                );
+              },
+            );
+          },
+        );
+      },
+    );
+  }
+
+  /// Hộp thoại thêm hình nền mới vào kho thư viện từ thiết bị
+  void _showAddBackgroundToLibraryDialog(VoidCallback onAdded) {
+    String name = '';
+    String category = 'Tùy chọn';
+    String pickedImagePath = '';
+
+    showDialog(
+      context: context,
+      builder: (dialogContext) {
+        return StatefulBuilder(
+          builder: (context, setStateDialog) {
+            return AlertDialog(
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(20),
+              ),
+              title: const Text(
+                'Thêm hình nền vào kho',
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+              ),
+              content: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    TextField(
+                      autofocus: true,
+                      onChanged: (val) => name = val,
+                      decoration: InputDecoration(
+                        labelText: 'Tên hình nền',
+                        hintText: 'VD: Rồng lửa, Đêm sao...',
+                        filled: true,
+                        fillColor: Colors.grey.shade50,
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(12),
+                          borderSide: BorderSide.none,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 14),
+                    if (pickedImagePath.isNotEmpty) ...[
+                      ClipRRect(
+                        borderRadius: BorderRadius.circular(12),
+                        child: Container(
+                          height: 110,
+                          width: double.infinity,
+                          color: const Color(0xFF1E1E2C),
+                          child: Image(
+                            image: getCustomImageProvider(pickedImagePath),
+                            fit: BoxFit.cover,
+                            errorBuilder: (context, error, stackTrace) =>
+                                const Center(
+                              child: Icon(Icons.broken_image,
+                                  color: Colors.white54),
+                            ),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 10),
+                    ],
+                    OutlinedButton.icon(
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: Colors.deepPurple,
+                        minimumSize: const Size.fromHeight(44),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                      ),
+                      icon: Icon(
+                        pickedImagePath.isEmpty
+                            ? Icons.add_photo_alternate
+                            : Icons.cached,
+                        size: 20,
+                      ),
+                      label: Text(
+                        pickedImagePath.isEmpty
+                            ? 'Chọn ảnh từ thiết bị'
+                            : 'Chọn ảnh khác từ máy',
+                        style: const TextStyle(fontWeight: FontWeight.bold),
+                      ),
+                      onPressed: () {
+                        _pickImageFromDevice((pickedPath) {
+                          setStateDialog(() {
+                            pickedImagePath = pickedPath;
+                          });
+                        });
+                      },
+                    ),
+                  ],
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(dialogContext),
+                  child: const Text('Hủy'),
+                ),
+                ElevatedButton(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.deepPurple,
+                    foregroundColor: Colors.white,
+                  ),
+                  onPressed: () {
+                    if (name.trim().isNotEmpty &&
+                        pickedImagePath.trim().isNotEmpty) {
+                      final newItem = BackgroundItem(
+                        id: DateTime.now().millisecondsSinceEpoch.toString(),
+                        title: name.trim(),
+                        urlOrPath: pickedImagePath.trim(),
+                        category: category,
+                      );
+                      _bgLibrary.add(newItem);
+                      _saveDataToPrefs();
+                      onAdded();
+                      Navigator.pop(dialogContext);
+                    }
+                  },
+                  child: const Text('Lưu vào kho'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+  }
+
+  /// Hộp thoại Thêm mới / Chỉnh sửa Task hoặc Habit
+  void _showItemDialog({Task? taskToEdit, Habit? habitToEdit}) {
+    final bool isEditing = taskToEdit != null || habitToEdit != null;
+    String title = taskToEdit?.title ?? habitToEdit?.title ?? '';
+    bool isHabit = habitToEdit != null;
+    DateTime tempDate = taskToEdit?.dueDate ?? _selectedDate;
+    String themeType =
+        taskToEdit?.themeType ?? habitToEdit?.themeType ?? 'default';
+    String customBg = taskToEdit?.customBackgroundImage ??
+        habitToEdit?.customBackgroundImage ??
+        '';
+
+    TimeOfDay? tempTime;
+    String? initialTimeStr =
+        taskToEdit?.reminderTime ?? habitToEdit?.reminderTime;
+    if (initialTimeStr != null) {
+      final parts = initialTimeStr.split(':');
+      if (parts.length == 2) {
+        tempTime = TimeOfDay(
+          hour: int.parse(parts[0]),
+          minute: int.parse(parts[1]),
+        );
+      }
+    }
+
+    Tag? selectedTag = (taskToEdit?.tags.isNotEmpty == true)
+        ? taskToEdit!.tags.first
+        : ((habitToEdit?.tags.isNotEmpty == true)
+            ? habitToEdit!.tags.first
+            : (_availableTags.isNotEmpty ? _availableTags.first : null));
+
+    final titleController = TextEditingController(text: title);
+
+    showDialog(
+      context: context,
+      builder: (dialogContext) {
+        return StatefulBuilder(
+          builder: (context, setStateDialog) {
+            return AlertDialog(
+              insetPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 24),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(24),
+              ),
+              title: Text(
+                isEditing ? 'Chỉnh Sửa Hoạt Động' : 'Thêm Hoạt Động',
+                style: const TextStyle(
+                  fontSize: 18,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+              content: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    TextField(
+                      controller: titleController,
+                      onChanged: (val) => title = val,
+                      decoration: InputDecoration(
+                        hintText: 'Tên nhiệm vụ (VD: Săn rồng, Đá bóng...)',
+                        filled: true,
+                        fillColor: Colors.grey.shade50,
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+
+                    // --- CHỌN CHỦ ĐỀ HỆ THỐNG ---
+                    const Text(
+                      'Chủ Đề Hệ Thống:',
+                      style: TextStyle(
+                        fontWeight: FontWeight.bold,
+                        fontSize: 13,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    DropdownButtonFormField<String>(
+                      isExpanded: true,
+                      initialValue: themeType,
+                      decoration: InputDecoration(
+                        filled: true,
+                        fillColor: Colors.grey.shade50,
+                        contentPadding: const EdgeInsets.symmetric(
+                            horizontal: 12, vertical: 8),
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(12),
+                          borderSide: BorderSide.none,
+                        ),
+                      ),
+                      items: const [
+                        DropdownMenuItem(
+                          value: 'default',
+                          child: Text(
+                            '📌 Mặc định',
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                        DropdownMenuItem(
+                          value: 'game',
+                          child: Text(
+                            '🐉 Game (Call of Dragons / Behemoth)',
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                        DropdownMenuItem(
+                          value: 'sport',
+                          child: Text(
+                            '⚽ Thể thao (Cầu lông, Bóng đá)',
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                      ],
+                      onChanged: (val) =>
+                          setStateDialog(() => themeType = val ?? 'default'),
+                    ),
+                    const SizedBox(height: 16),
+
+                    // --- CHỌN NHÃN DÁN (TAGS) & TẠO NHÃN MỚI ---
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        const Expanded(
+                          child: Text(
+                            'Nhãn Dán (Tag):',
+                            style: TextStyle(
+                              fontWeight: FontWeight.bold,
+                              fontSize: 13,
+                            ),
+                          ),
+                        ),
+                        TextButton.icon(
+                          style: TextButton.styleFrom(
+                            visualDensity: VisualDensity.compact,
+                          ),
+                          icon: const Icon(Icons.add_circle_outline, size: 15),
+                          label: const Text('Tạo nhãn',
+                              style: TextStyle(fontSize: 12)),
+                          onPressed: () {
+                            _showCreateTagDialog((newTag) {
+                              setStateDialog(() {
+                                selectedTag = newTag;
+                              });
+                            });
+                          },
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 6),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 6,
+                      children: _availableTags.map((tag) {
+                        final isSelected = selectedTag?.id == tag.id;
+                        return ChoiceChip(
+                          label: Text(
+                            tag.name,
+                            style: TextStyle(
+                              color: isSelected ? Colors.white : Colors.black87,
+                              fontWeight: isSelected
+                                  ? FontWeight.bold
+                                  : FontWeight.normal,
+                              fontSize: 12,
+                            ),
+                          ),
+                          selected: isSelected,
+                          selectedColor: Color(tag.colorValue),
+                          backgroundColor:
+                              Color(tag.colorValue).withValues(alpha: 0.15),
+                          checkmarkColor: Colors.white,
+                          onSelected: (selected) {
+                            setStateDialog(() {
+                              selectedTag = selected ? tag : null;
+                            });
+                          },
+                        );
+                      }).toList(),
+                    ),
+                    const SizedBox(height: 16),
+
+                    // --- CHỌN ẢNH NỀN TÙY CHỈNH (CHỈ LẤY TỪ MÁY / THƯ VIỆN, BỎ URL TEXTFIELD) ---
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        const Expanded(
+                          child: Text(
+                            'Hình Nền Card (Background):',
+                            style: TextStyle(
+                              fontWeight: FontWeight.bold,
+                              fontSize: 13,
+                            ),
+                          ),
+                        ),
+                        if (customBg.trim().isNotEmpty)
+                          TextButton(
+                            style: TextButton.styleFrom(
+                              visualDensity: VisualDensity.compact,
+                              foregroundColor: Colors.redAccent,
+                            ),
+                            onPressed: () {
+                              setStateDialog(() {
+                                customBg = '';
+                              });
+                            },
+                            child: const Text('Xóa nền',
+                                style: TextStyle(fontSize: 12)),
+                          ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+
+                    // Preview ảnh nền nhỏ
+                    if (customBg.trim().isNotEmpty) ...[
+                      Container(
+                        height: 64,
+                        margin: const EdgeInsets.only(bottom: 10),
+                        decoration: BoxDecoration(
+                          borderRadius: BorderRadius.circular(14),
+                          color: const Color(0xFF1E1E2C),
+                          image: DecorationImage(
+                            image: getCustomImageProvider(customBg),
+                            fit: BoxFit.cover,
+                            colorFilter: ColorFilter.mode(
+                              Colors.black.withValues(alpha: 0.55),
+                              BlendMode.darken,
+                            ),
+                            // ignore: unnecessary_underscores
+                            onError: (_, __) {},
+                          ),
+                        ),
+                        alignment: Alignment.center,
+                        child: const Text(
+                          'Xem trước: Lớp phủ mờ bảo toàn chữ ✨',
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontWeight: FontWeight.bold,
+                            fontSize: 11,
+                          ),
+                        ),
+                      ),
+                    ],
+
+                    Row(
+                      children: [
+                        Expanded(
+                          child: ElevatedButton.icon(
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: Colors.deepPurple.shade50,
+                              foregroundColor: Colors.deepPurple,
+                              elevation: 0,
+                              padding: const EdgeInsets.symmetric(
+                                  vertical: 10, horizontal: 4),
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(12),
+                                side: BorderSide(
+                                    color: Colors.deepPurple.shade200),
+                              ),
+                            ),
+                            icon: const Icon(Icons.add_photo_alternate,
+                                size: 16),
+                            label: const FittedBox(
+                              fit: BoxFit.scaleDown,
+                              child: Text(
+                                'Lấy ảnh từ máy',
+                                style: TextStyle(
+                                    fontWeight: FontWeight.bold, fontSize: 12),
+                              ),
+                            ),
+                            onPressed: () {
+                              _pickImageFromDevice((pickedPath) {
+                                setStateDialog(() {
+                                  customBg = pickedPath;
+                                });
+                              });
+                            },
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: OutlinedButton.icon(
+                            style: OutlinedButton.styleFrom(
+                              padding: const EdgeInsets.symmetric(
+                                  vertical: 10, horizontal: 4),
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(12),
+                              ),
+                            ),
+                            icon: const Icon(Icons.photo_library_outlined,
+                                size: 16),
+                            label: const FittedBox(
+                              fit: BoxFit.scaleDown,
+                              child: Text(
+                                'Kho thư viện',
+                                style: TextStyle(fontSize: 12),
+                              ),
+                            ),
+                            onPressed: () {
+                              _showBackgroundLibrarySheet((selectedUrl) {
+                                setStateDialog(() {
+                                  customBg = selectedUrl;
+                                });
+                              });
+                            },
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 16),
+
+                    if (!isEditing) ...[
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          Text(
+                            isHabit ? '🔥 Thói quen' : '📋 Công việc',
+                            style: const TextStyle(fontWeight: FontWeight.bold),
+                          ),
+                          Switch.adaptive(
+                            value: isHabit,
+                            activeThumbColor: Colors.deepOrange,
+                            onChanged: (val) =>
+                                setStateDialog(() => isHabit = val),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 16),
+                    ],
+
+                    // --- CHỌN NGÀY VÀ HẸN GIỜ THỰC HIỆN CÔNG VIỆC ---
+                    const Text(
+                      'Thời Gian Thực Hiện:',
+                      style: TextStyle(
+                        fontWeight: FontWeight.bold,
+                        fontSize: 13,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Row(
+                      children: [
+                        // CHỌN NGÀY THỰC HIỆN
+                        Expanded(
+                          child: InkWell(
+                            onTap: () async {
+                              final pickedDate = await showDatePicker(
+                                context: context,
+                                initialDate: tempDate,
+                                firstDate: DateTime(2025),
+                                lastDate: DateTime(2030),
+                              );
+                              if (pickedDate != null) {
+                                setStateDialog(() => tempDate = pickedDate);
+                              }
+                            },
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(
+                                  horizontal: 8, vertical: 8),
+                              decoration: BoxDecoration(
+                                border:
+                                    Border.all(color: Colors.grey.shade300),
+                                borderRadius: BorderRadius.circular(12),
+                              ),
+                              child: Row(
+                                children: [
+                                  const Icon(
+                                    Icons.calendar_today,
+                                    size: 15,
+                                    color: Colors.deepPurple,
+                                  ),
+                                  const SizedBox(width: 6),
+                                  Expanded(
+                                    child: Column(
+                                      crossAxisAlignment:
+                                          CrossAxisAlignment.start,
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        const Text(
+                                          'Ngày thực hiện',
+                                          style: TextStyle(
+                                            fontSize: 9,
+                                            color: Colors.grey,
+                                          ),
+                                          maxLines: 1,
+                                          overflow: TextOverflow.ellipsis,
+                                        ),
+                                        FittedBox(
+                                          fit: BoxFit.scaleDown,
+                                          alignment: Alignment.centerLeft,
+                                          child: Text(
+                                            DateFormat('dd/MM/yyyy')
+                                                .format(tempDate),
+                                            style: const TextStyle(
+                                              fontWeight: FontWeight.bold,
+                                              fontSize: 12,
+                                            ),
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+
+                        // HẸN GIỜ NHẮC NHỞ
+                        Expanded(
+                          child: InkWell(
+                            onTap: () async {
+                              final pickedTime = await showTimePicker(
+                                context: context,
+                                initialTime: tempTime ?? TimeOfDay.now(),
+                              );
+                              if (pickedTime != null) {
+                                setStateDialog(() => tempTime = pickedTime);
+                              }
+                            },
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(
+                                  horizontal: 8, vertical: 8),
+                              decoration: BoxDecoration(
+                                border:
+                                    Border.all(color: Colors.grey.shade300),
+                                borderRadius: BorderRadius.circular(12),
+                              ),
+                              child: Row(
+                                children: [
+                                  const Icon(
+                                    Icons.alarm,
+                                    size: 15,
+                                    color: Colors.deepOrange,
+                                  ),
+                                  const SizedBox(width: 6),
+                                  Expanded(
+                                    child: Column(
+                                      crossAxisAlignment:
+                                          CrossAxisAlignment.start,
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        const Text(
+                                          'Giờ nhắc nhở',
+                                          style: TextStyle(
+                                            fontSize: 9,
+                                            color: Colors.grey,
+                                          ),
+                                          maxLines: 1,
+                                          overflow: TextOverflow.ellipsis,
+                                        ),
+                                        FittedBox(
+                                          fit: BoxFit.scaleDown,
+                                          alignment: Alignment.centerLeft,
+                                          child: Text(
+                                            tempTime == null
+                                                ? 'Chưa đặt'
+                                                : tempTime!.format(context),
+                                            style: const TextStyle(
+                                              fontWeight: FontWeight.bold,
+                                              fontSize: 12,
+                                            ),
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(dialogContext),
+                  child: const Text('Hủy'),
+                ),
+                ElevatedButton(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.deepPurple,
+                    foregroundColor: Colors.white,
+                  ),
+                  onPressed: () {
+                    final currentTitle = titleController.text.trim().isNotEmpty
+                        ? titleController.text.trim()
+                        : title.trim();
+                    if (currentTitle.isNotEmpty) {
+                      final timeStr = tempTime != null
+                          ? '${tempTime!.hour.toString().padLeft(2, '0')}:${tempTime!.minute.toString().padLeft(2, '0')}'
+                          : null;
+                      final List<Tag> tagList = selectedTag != null
+                          ? [selectedTag!]
+                          : <Tag>[];
+                      final finalCustomBg = customBg.trim().isNotEmpty
+                          ? customBg.trim()
+                          : null;
+
+                      setState(() {
+                        if (isEditing) {
+                          if (taskToEdit != null) {
+                            taskToEdit.title = currentTitle;
+                            taskToEdit.dueDate = tempDate;
+                            taskToEdit.reminderTime = timeStr;
+                            taskToEdit.tags = tagList;
+                            taskToEdit.themeType = themeType;
+                            taskToEdit.customBackgroundImage = finalCustomBg;
+                          } else if (habitToEdit != null) {
+                            habitToEdit.title = currentTitle;
+                            habitToEdit.reminderTime = timeStr;
+                            habitToEdit.tags = tagList;
+                            habitToEdit.themeType = themeType;
+                            habitToEdit.customBackgroundImage = finalCustomBg;
+                          }
+                        } else {
+                          if (isHabit) {
+                            _habits.add(
+                              Habit(
+                                id: DateTime.now().millisecondsSinceEpoch
+                                    .toString(),
+                                title: currentTitle,
+                                reminderTime: timeStr,
+                                tags: tagList,
+                                themeType: themeType,
+                                customBackgroundImage: finalCustomBg,
+                              ),
+                            );
+                          } else {
+                            _tasks.add(
+                              Task(
+                                id: DateTime.now().millisecondsSinceEpoch
+                                    .toString(),
+                                title: currentTitle,
+                                dueDate: tempDate,
+                                reminderTime: timeStr,
+                                tags: tagList,
+                                themeType: themeType,
+                                customBackgroundImage: finalCustomBg,
+                              ),
+                            );
+                            // Tự động chuyển ngày hiển thị sang ngày vừa đặt để người dùng thấy ngay
+                            _selectedDate = tempDate;
+                          }
+                        }
+                      });
+                      _saveDataToPrefs();
+                      Navigator.pop(dialogContext);
+                    }
+                  },
+                  child: Text(isEditing ? 'Lưu' : 'Tạo mới'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+  }
+
+  // Card hiển thị linh hoạt: Ưu tiên Custom Bg -> Theme Type -> Mặc định
+  Widget buildThemedCard({
+    required String title,
+    required String themeType,
+    String? customBg,
+    required bool isCompleted,
+    required VoidCallback onTap,
+    required VoidCallback onUndo,
+    required VoidCallback onEdit,
+    required String? reminderTime,
+    required List<Tag> tags,
+    required String subtitleInfo,
+  }) {
+    final bool hasCustomBg = customBg != null && customBg.trim().isNotEmpty;
+    final bool isThemed = themeType != 'default';
+    final bool isDarkCard = hasCustomBg || isThemed;
+
+    Gradient cardGradient;
+    Color accentColor;
+    String badgeTitle;
+
+    if (themeType == 'game') {
+      cardGradient = const LinearGradient(
+        colors: [Color(0xFF2C1B4D), Color(0xFF512DA8), Color(0xFFB71C1C)],
+        begin: Alignment.topLeft,
+        end: Alignment.bottomRight,
+      );
+      accentColor = Colors.amberAccent;
+      badgeTitle = '🐉 CALL OF DRAGONS';
+    } else if (themeType == 'sport') {
+      cardGradient = const LinearGradient(
+        colors: [Color(0xFF004D40), Color(0xFF00796B), Color(0xFF388E3C)],
+        begin: Alignment.topLeft,
+        end: Alignment.bottomRight,
+      );
+      accentColor = Colors.lightGreenAccent;
+      badgeTitle = '⚽ THỂ THAO';
+    } else {
+      cardGradient = LinearGradient(
+        colors: [
+          Colors.deepPurple.shade50,
+          Colors.deepPurple.shade100.withValues(alpha: 0.5),
+        ],
+        begin: Alignment.topLeft,
+        end: Alignment.bottomRight,
+      );
+      accentColor = hasCustomBg ? Colors.amberAccent : Colors.deepPurple;
+      badgeTitle = hasCustomBg ? '✨ TÙY CHỈNH' : '📌 NHIỆM VỤ';
+    }
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 14),
+      decoration: BoxDecoration(
+        color: hasCustomBg
+            ? const Color(0xFF1E1E2C)
+            : (isThemed
+                ? null
+                : (isCompleted
+                    ? Colors.deepPurple.withValues(alpha: 0.08)
+                    : Colors.white)),
+        gradient: hasCustomBg ? null : (isThemed ? cardGradient : null),
+        image: hasCustomBg
+            ? DecorationImage(
+                image: getCustomImageProvider(customBg.trim()),
+                fit: BoxFit.cover,
+                colorFilter: ColorFilter.mode(
+                  Colors.black.withValues(alpha: 0.55),
+                  BlendMode.darken,
+                ),
+                // ignore: unnecessary_underscores
+                onError: (_, __) {},
+              )
+            : null,
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(
+          color: isCompleted
+              ? (isDarkCard
+                  ? Colors.amberAccent.withValues(alpha: 0.6)
+                  : Colors.deepPurple.shade300)
+              : (hasCustomBg
+                  ? Colors.white.withValues(alpha: 0.15)
+                  : Colors.transparent),
+          width: 1.5,
+        ),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: 0.08),
+            blurRadius: 10,
+            offset: const Offset(0, 4),
+          ),
+        ],
+      ),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(20),
+        child: Material(
+          color: Colors.transparent,
+          child: InkWell(
+            onTap: onTap,
+            onLongPress: onEdit,
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Row(
+                children: [
+                  Container(
+                    padding: const EdgeInsets.all(10),
+                    decoration: BoxDecoration(
+                      color: isDarkCard
+                          ? Colors.black.withValues(alpha: 0.35)
+                          : (isCompleted
+                              ? Colors.deepPurple
+                              : Colors.deepPurple.shade50),
+                      borderRadius: BorderRadius.circular(14),
+                    ),
+                    child: Icon(
+                      isCompleted
+                          ? Icons.undo
+                          : (themeType == 'game'
+                              ? Icons.local_fire_department
+                              : (themeType == 'sport'
+                                  ? Icons.sports_soccer
+                                  : (hasCustomBg
+                                      ? Icons.auto_awesome
+                                      : Icons.task_alt))),
+                      color: isDarkCard
+                          ? accentColor
+                          : (isCompleted ? Colors.white : Colors.deepPurple),
+                      size: 22,
+                    ),
+                  ),
+                  const SizedBox(width: 14),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        if (isThemed || hasCustomBg) ...[
+                          Text(
+                            badgeTitle,
+                            style: TextStyle(
+                              fontSize: 10,
+                              fontWeight: FontWeight.bold,
+                              color: accentColor,
+                              letterSpacing: 1.2,
+                            ),
+                          ),
+                          const SizedBox(height: 2),
+                        ],
+                        Text(
+                          title,
+                          style: TextStyle(
+                            fontWeight: FontWeight.bold,
+                            fontSize: 15,
+                            // BỎ GẠCH NGANG TÊN THEO YÊU CẦU
+                            decoration: TextDecoration.none,
+                            color: isDarkCard
+                                ? Colors.white
+                                : (isCompleted
+                                    ? Colors.deepPurple
+                                    : Colors.black87),
+                          ),
+                        ),
+                        const SizedBox(height: 6),
+                        Wrap(
+                          spacing: 6,
+                          runSpacing: 4,
+                          children: [
+                            if (reminderTime != null)
+                              Container(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 8,
+                                  vertical: 2,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: isDarkCard
+                                      ? Colors.black.withValues(alpha: 0.4)
+                                      : Colors.grey.shade200,
+                                  borderRadius: BorderRadius.circular(6),
+                                ),
+                                child: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Icon(
+                                      Icons.alarm,
+                                      size: 11,
+                                      color: isDarkCard
+                                          ? accentColor
+                                          : Colors.grey.shade700,
+                                    ),
+                                    Text(
+                                      ' $reminderTime',
+                                      style: TextStyle(
+                                        fontSize: 11,
+                                        fontWeight: FontWeight.bold,
+                                        color: isDarkCard
+                                            ? accentColor
+                                            : Colors.grey.shade700,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            Text(
+                              subtitleInfo,
+                              style: TextStyle(
+                                fontSize: 11,
+                                color: isDarkCard
+                                    ? Colors.white70
+                                    : Colors.grey.shade600,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ),
+                  if (_currentTabIndex == 1)
+                    IconButton(
+                      icon: Icon(
+                        Icons.undo,
+                        color: isDarkCard ? Colors.white : Colors.deepPurple,
+                        size: 20,
+                      ),
+                      tooltip: 'Khôi phục lại',
+                      onPressed: onUndo,
+                    ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_isLoading) {
+      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    }
+
+    final filteredTasks = _tasks.where((task) {
+      final matchTag = _selectedFilterTag == null ||
+          task.tags.any((t) => t.id == _selectedFilterTag!.id);
+      final matchDate = task.dueDate.year == _selectedDate.year &&
+          task.dueDate.month == _selectedDate.month &&
+          task.dueDate.day == _selectedDate.day;
+
+      if (_currentTabIndex == 0) {
+        return matchDate && matchTag && !task.isCompleted;
+      } else {
+        return matchDate && matchTag && task.isCompleted;
+      }
+    }).toList();
+
+    if (_currentTabIndex == 1) {
+      filteredTasks.sort((a, b) => b.dueDate.compareTo(a.dueDate));
+    }
+
+    final filteredHabits = _habits.where((habit) {
+      final matchTag = _selectedFilterTag == null ||
+          habit.tags.any((t) => t.id == _selectedFilterTag!.id);
+      return matchTag &&
+          (_currentTabIndex == 0
+              ? !habit.isCompletedToday
+              : habit.isCompletedToday);
+    }).toList();
+
+    return Scaffold(
+      backgroundColor: Colors.grey.shade50,
+      appBar: AppBar(
+        elevation: 0,
+        backgroundColor: Colors.white,
+        title: Text(
+          widget.title,
+          style: const TextStyle(
+            fontWeight: FontWeight.bold,
+            color: Colors.black87,
+          ),
+        ),
+        actions: [
+          // Nút chọn lịch LUÔN hiển thị ở cả 2 tab theo yêu cầu
+          IconButton(
+            icon: const Icon(Icons.calendar_month, color: Colors.deepPurple),
+            tooltip: 'Chọn ngày lịch',
+            onPressed: () async {
+              final picked = await showDatePicker(
+                context: context,
+                initialDate: _selectedDate,
+                firstDate: DateTime(2025),
+                lastDate: DateTime(2030),
+              );
+              if (picked != null) setState(() => _selectedDate = picked);
+            },
+          ),
+        ],
+      ),
+      body: ListView(
+        padding: const EdgeInsets.all(16.0),
+        children: [
+          // =========================================================================
+          // BANNER NGÀY THÁNG CỐ ĐỊNH Ở ĐẦU TRANG (LUÔN HIỂN THỊ Ở CẢ 2 TAB CẦN LÀM / ĐÃ XONG)
+          // =========================================================================
+          Container(
+            padding: const EdgeInsets.all(14),
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                colors: [
+                  Colors.deepPurple.shade50,
+                  Colors.deepPurple.shade100.withValues(alpha: 0.5),
+                ],
+              ),
+              borderRadius: BorderRadius.circular(16),
+            ),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Expanded(
+                  child: Row(
+                    children: [
+                      const Icon(
+                        Icons.today,
+                        color: Colors.deepPurple,
+                        size: 20,
+                      ),
+                      const SizedBox(width: 8),
+                      Flexible(
+                        child: Text(
+                          'Ngày: ${DateFormat('dd/MM/yyyy').format(_selectedDate)}',
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            fontWeight: FontWeight.bold,
+                            color: Colors.deepPurple,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(width: 8),
+                TextButton(
+                  style: TextButton.styleFrom(
+                    backgroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 6,
+                    ),
+                  ),
+                  onPressed: () =>
+                      setState(() => _selectedDate = DateTime.now()),
+                  child: const Text(
+                    'Hôm nay',
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 16),
+
+          // ==========================================
+          // THANH CHUYỂN TAB NẰM CỐ ĐỊNH PHÍA TRÊN
+          // ==========================================
+          Container(
+            padding: const EdgeInsets.all(4),
+            decoration: BoxDecoration(
+              color: Colors.grey.shade200,
+              borderRadius: BorderRadius.circular(16),
+            ),
+            child: Row(
+              children: [
+                Expanded(
+                  child: GestureDetector(
+                    onTap: () => setState(() => _currentTabIndex = 0),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(vertical: 12),
+                      alignment: Alignment.center,
+                      decoration: BoxDecoration(
+                        color: _currentTabIndex == 0
+                            ? Colors.white
+                            : Colors.transparent,
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                      child: Text(
+                        'Cần làm',
+                        style: TextStyle(
+                          fontWeight: FontWeight.bold,
+                          color: _currentTabIndex == 0
+                            ? Colors.deepPurple
+                            : Colors.grey.shade600,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+                Expanded(
+                  child: GestureDetector(
+                    onTap: () => setState(() => _currentTabIndex = 1),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(vertical: 12),
+                      alignment: Alignment.center,
+                      decoration: BoxDecoration(
+                        color: _currentTabIndex == 1
+                            ? Colors.white
+                            : Colors.transparent,
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                      child: Text(
+                        'Đã hoàn thành',
+                        style: TextStyle(
+                          fontWeight: FontWeight.bold,
+                          color: _currentTabIndex == 1
+                            ? Colors.deepPurple
+                            : Colors.grey.shade600,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 16),
+
+          // Thanh lọc theo nhãn dán (Tag filter)
+          SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            child: Row(
+              children: [
+                FilterChip(
+                  label: const Text('Tất cả'),
+                  selected: _selectedFilterTag == null,
+                  onSelected: (bool selected) =>
+                      setState(() => _selectedFilterTag = null),
+                ),
+                const SizedBox(width: 8),
+                ..._availableTags.map((tag) {
+                  final isSelected = _selectedFilterTag?.id == tag.id;
+                  return Padding(
+                    padding: const EdgeInsets.only(right: 8),
+                    child: FilterChip(
+                      label: Text(tag.name),
+                      selected: isSelected,
+                      selectedColor: Color(tag.colorValue).withValues(alpha: 0.3),
+                      checkmarkColor: Color(tag.colorValue),
+                      onSelected: (bool selected) => setState(
+                        () => _selectedFilterTag = selected ? tag : null,
+                      ),
+                    ),
+                  );
+                }),
+              ],
+            ),
+          ),
+          const SizedBox(height: 20),
+
+          // --- THÓI QUEN ---
+          const Text(
+            '🔥 Thói Quen Hàng Ngày',
+            style: TextStyle(
+              fontSize: 16,
+              fontWeight: FontWeight.bold,
+              color: Colors.deepOrange,
+            ),
+          ),
+          const SizedBox(height: 10),
+          filteredHabits.isEmpty
+              ? Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 10),
+                  child: Text(
+                    _currentTabIndex == 0
+                        ? 'Không có thói quen nào cần làm.'
+                        : 'Chưa có thói quen nào hoàn thành.',
+                    style: TextStyle(color: Colors.grey.shade500, fontSize: 13),
+                  ),
+                )
+              : Column(
+                  children: filteredHabits
+                      .map(
+                        (habit) => Dismissible(
+                          key: Key(habit.id),
+                          direction: DismissDirection.endToStart,
+                          background: Container(
+                            alignment: Alignment.centerRight,
+                            padding: const EdgeInsets.only(right: 20),
+                            margin: const EdgeInsets.only(bottom: 12),
+                            decoration: BoxDecoration(
+                              color: Colors.red.shade400,
+                              borderRadius: BorderRadius.circular(16),
+                            ),
+                            child: const Icon(
+                              Icons.delete,
+                              color: Colors.white,
+                            ),
+                          ),
+                          onDismissed: (_) {
+                            setState(() => _habits.remove(habit));
+                            _saveDataToPrefs();
+                          },
+                          child: buildThemedCard(
+                            title: habit.title,
+                            themeType: habit.themeType,
+                            customBg: habit.customBackgroundImage,
+                            isCompleted: habit.isCompletedToday,
+                            reminderTime: habit.reminderTime,
+                            tags: habit.tags,
+                            subtitleInfo: 'Chuỗi: ${habit.streak} ngày',
+                            onTap: () {
+                              setState(() {
+                                habit.isCompletedToday =
+                                    !habit.isCompletedToday;
+                                if (habit.isCompletedToday) {
+                                  habit.streak++;
+                                } else {
+                                  habit.streak = habit.streak > 0
+                                      ? habit.streak - 1
+                                      : 0;
+                                }
+                              });
+                              _saveDataToPrefs();
+                            },
+                            onUndo: () {
+                              setState(() {
+                                habit.isCompletedToday = false;
+                                habit.streak = habit.streak > 0
+                                    ? habit.streak - 1
+                                    : 0;
+                              });
+                              _saveDataToPrefs();
+                            },
+                            onEdit: () => _showItemDialog(habitToEdit: habit),
+                          ),
+                        ),
+                      )
+                      .toList(),
+                ),
+
+          const SizedBox(height: 16),
+
+          // --- CÔNG VIỆC ---
+          Text(
+            _currentTabIndex == 0
+                ? '📋 Công Việc Cần Làm (${filteredTasks.length})'
+                : '✅ Công Việc Đã Hoàn Thành (${filteredTasks.length})',
+            style: const TextStyle(
+              fontSize: 16,
+              fontWeight: FontWeight.bold,
+              color: Colors.deepPurple,
+            ),
+          ),
+          const SizedBox(height: 10),
+          filteredTasks.isEmpty
+              ? Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 20),
+                  child: Center(
+                    child: Text(
+                      _currentTabIndex == 0
+                          ? 'Không có công việc nào cần làm trong ngày này.'
+                          : 'Chưa có công việc nào hoàn thành trong ngày này.',
+                      style: TextStyle(color: Colors.grey.shade500),
+                    ),
+                  ),
+                )
+              : Column(
+                  children: filteredTasks
+                      .map(
+                        (task) => Dismissible(
+                          key: Key(task.id),
+                          direction: DismissDirection.endToStart,
+                          background: Container(
+                            alignment: Alignment.centerRight,
+                            padding: const EdgeInsets.only(right: 20),
+                            margin: const EdgeInsets.only(bottom: 12),
+                            decoration: BoxDecoration(
+                              color: Colors.red.shade400,
+                              borderRadius: BorderRadius.circular(16),
+                            ),
+                            child: const Icon(
+                              Icons.delete,
+                              color: Colors.white,
+                            ),
+                          ),
+                          onDismissed: (_) {
+                            setState(() => _tasks.remove(task));
+                            _saveDataToPrefs();
+                          },
+                          child: buildThemedCard(
+                            title: task.title,
+                            themeType: task.themeType,
+                            customBg: task.customBackgroundImage,
+                            isCompleted: task.isCompleted,
+                            reminderTime: task.reminderTime,
+                            tags: task.tags,
+                            subtitleInfo: _currentTabIndex == 1
+                                ? '📅 ${DateFormat('dd/MM/yyyy').format(task.dueDate)}'
+                                : 'Hạn: ${DateFormat('dd/MM/yyyy').format(task.dueDate)}',
+                            onTap: () {
+                              setState(
+                                () => task.isCompleted = !task.isCompleted,
+                              );
+                              _saveDataToPrefs();
+                            },
+                            onUndo: () {
+                              setState(() => task.isCompleted = false);
+                              _saveDataToPrefs();
+                            },
+                            onEdit: () => _showItemDialog(taskToEdit: task),
+                          ),
+                        ),
+                      )
+                      .toList(),
+                ),
+        ],
+      ),
+      floatingActionButton: FloatingActionButton.extended(
+        onPressed: () => _showItemDialog(),
+        backgroundColor: Colors.deepPurple,
+        foregroundColor: Colors.white,
+        icon: const Icon(Icons.add),
+        label: const Text(
+          'Thêm mới',
+          style: TextStyle(fontWeight: FontWeight.bold),
+        ),
+      ),
+    );
+  }
+}
