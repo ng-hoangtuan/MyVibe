@@ -1890,12 +1890,8 @@ class _HomeScreenState extends State<HomeScreen> {
               children: [
                 _buildDateBanner(),
                 const SizedBox(height: 16),
-                // Chỉ phần này nghe _tabIndex, nên kéo tab không làm
-                // dựng lại danh sách thẻ
-                ValueListenableBuilder<int>(
-                  valueListenable: _tabIndex,
-                  builder: (_, tabIndex, _) => _buildTabBar(tabIndex),
-                ),
+                // Chỉ phần này dựng lại khi kéo, danh sách thẻ không bị đụng
+                _buildTabBar(),
                 const SizedBox(height: 16),
                 _buildTagFilter(),
               ],
@@ -1981,52 +1977,89 @@ class _HomeScreenState extends State<HomeScreen> {
 
   /// Thanh chuyển tab. Bấm thì chạy animation sang trang tương ứng, còn kéo
   /// ngang trên nội dung thì PageView tự đổi và onPageChanged cập nhật lại đây.
-  Widget _buildTabBar(int currentTab) {
-    return Container(
-      padding: const EdgeInsets.all(4),
-      decoration: BoxDecoration(
-        color: Colors.grey.shade200,
-        borderRadius: BorderRadius.circular(16),
-      ),
-      child: Row(
-        children: [
-          _buildTabButton(
-            index: 0,
-            label: 'Cần làm',
-            isActive: currentTab == 0,
+  /// Vị trí trang hiện tại dưới dạng số thực: 0.0 = Cần làm, 1.0 = Đã hoàn
+  /// thành, ở giữa là đang kéo dở.
+  double get _pagePosition {
+    if (_pageController.hasClients && _pageController.position.haveDimensions) {
+      final double? page = _pageController.page;
+      if (page != null) return page.clamp(0.0, 1.0);
+    }
+    return _tabIndex.value.toDouble();
+  }
+
+  /// Thanh chuyển tab.
+  ///
+  /// Chỉ có MỘT ô trắng, trượt liên tục theo đúng vị trí trang. Trước đây mỗi
+  /// tab là một AnimatedContainer tự đổi màu, nên lúc chuyển có 220ms cả hai
+  /// cùng sáng, và ô trắng thì nhảy chứ không chạy theo ngón tay.
+  Widget _buildTabBar() {
+    return AnimatedBuilder(
+      animation: Listenable.merge([_pageController, _tabIndex]),
+      builder: (context, _) {
+        final double pos = _pagePosition;
+        return Container(
+          padding: const EdgeInsets.all(4),
+          decoration: BoxDecoration(
+            color: Colors.grey.shade200,
+            borderRadius: BorderRadius.circular(16),
           ),
-          _buildTabButton(
-            index: 1,
-            label: 'Đã hoàn thành',
-            isActive: currentTab == 1,
+          child: LayoutBuilder(
+            builder: (context, constraints) {
+              final double tabWidth = constraints.maxWidth / 2;
+              return Stack(
+                children: [
+                  // Ô trắng trượt theo ngón tay
+                  Positioned(
+                    left: tabWidth * pos,
+                    top: 0,
+                    bottom: 0,
+                    width: tabWidth,
+                    child: DecoratedBox(
+                      decoration: BoxDecoration(
+                        color: Colors.white,
+                        borderRadius: BorderRadius.circular(12),
+                        boxShadow: [
+                          BoxShadow(
+                            color: Colors.black.withValues(alpha: 0.06),
+                            blurRadius: 4,
+                            offset: const Offset(0, 1),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                  Row(
+                    children: [
+                      _buildTabButton(0, 'Cần làm', 1.0 - pos),
+                      _buildTabButton(1, 'Đã hoàn thành', pos),
+                    ],
+                  ),
+                ],
+              );
+            },
           ),
-        ],
-      ),
+        );
+      },
     );
   }
 
-  Widget _buildTabButton({
-    required int index,
-    required String label,
-    required bool isActive,
-  }) {
+  /// [activeness] 0 = không được chọn, 1 = đang được chọn; ở giữa thì màu chữ
+  /// chuyển dần theo để khớp với ô trắng đang trượt.
+  Widget _buildTabButton(int index, String label, double activeness) {
+    final double t = activeness.clamp(0.0, 1.0);
     return Expanded(
       child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
         onTap: () => _goToTab(index),
-        child: AnimatedContainer(
-          duration: const Duration(milliseconds: 220),
-          curve: Curves.easeOut,
+        child: Padding(
           padding: const EdgeInsets.symmetric(vertical: 12),
-          alignment: Alignment.center,
-          decoration: BoxDecoration(
-            color: isActive ? Colors.white : Colors.transparent,
-            borderRadius: BorderRadius.circular(12),
-          ),
-          child: Text(
-            label,
-            style: TextStyle(
-              fontWeight: FontWeight.bold,
-              color: isActive ? Colors.deepPurple : Colors.grey.shade600,
+          child: Center(
+            child: Text(
+              label,
+              style: TextStyle(
+                fontWeight: FontWeight.bold,
+                color: Color.lerp(Colors.grey.shade600, Colors.deepPurple, t),
+              ),
             ),
           ),
         ),
