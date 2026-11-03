@@ -31,10 +31,12 @@ class WidgetService {
       final List<Task> todayTasks = tasks
           .where((Task t) => _isSameDay(t.dueDate, now))
           .toList();
-      final List<Task> pendingTasks =
-          todayTasks.where((Task t) => !t.isCompleted).toList();
-      final List<Habit> pendingHabits =
-          habits.where((Habit h) => !h.isCompletedToday).toList();
+      final List<Task> pendingTasks = todayTasks
+          .where((Task t) => !t.isCompleted)
+          .toList();
+      final List<Habit> pendingHabits = habits
+          .where((Habit h) => !h.isCompletedToday)
+          .toList();
 
       // Sắp xếp theo giờ nhắc, việc chưa đặt giờ xuống cuối
       pendingTasks.sort(
@@ -67,8 +69,8 @@ class WidgetService {
         final String? nextRaw = pendingTasks.isNotEmpty
             ? pendingTasks.first.reminderTime
             : (pendingHabits.isNotEmpty
-                ? pendingHabits.first.reminderTime
-                : null);
+                  ? pendingHabits.first.reminderTime
+                  : null);
 
         title = nextTitle ?? 'Chạm để xem chi tiết';
         nextTime = nextRaw ?? '';
@@ -76,12 +78,16 @@ class WidgetService {
 
       // Tối đa 4 dòng chi tiết cho widget cỡ lớn
       final List<String> lines = <String>[
-        ...pendingTasks.take(3).map(
+        ...pendingTasks
+            .take(3)
+            .map(
               (Task t) => t.reminderTime != null
                   ? '• ${t.reminderTime}  ${t.title}'
                   : '• ${t.title}',
             ),
-        ...pendingHabits.take(2).map(
+        ...pendingHabits
+            .take(2)
+            .map(
               (Habit h) => h.reminderTime != null
                   ? '🔥 ${h.reminderTime}  ${h.title}'
                   : '🔥 ${h.title}',

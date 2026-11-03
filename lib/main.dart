@@ -8,10 +8,14 @@ import 'package:intl/intl.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'models/reminder_payload.dart';
 import 'models/task_habit_model.dart';
+import 'screens/reminder_screen.dart';
 import 'services/day_transition_service.dart';
 import 'services/notification_service.dart';
 import 'services/widget_service.dart';
+import 'utils/image_utils.dart';
+import 'widgets/app_toast.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -22,6 +26,9 @@ void main() async {
   runApp(const TaskHabitApp());
 }
 
+/// Dùng để mở màn hình nhắc toàn khung từ ngoài cây widget (khi thông báo nổ).
+final GlobalKey<NavigatorState> appNavigatorKey = GlobalKey<NavigatorState>();
+
 class TaskHabitApp extends StatelessWidget {
   const TaskHabitApp({super.key});
 
@@ -29,6 +36,7 @@ class TaskHabitApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'Task & Habit Tracker',
+      navigatorKey: appNavigatorKey,
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(
@@ -39,26 +47,6 @@ class TaskHabitApp extends StatelessWidget {
       ),
       home: const HomeScreen(title: 'Hôm Nay Của Tôi'),
     );
-  }
-}
-
-/// Helper an toàn chuyển đổi đường dẫn (URL mạng, data base64 URI, hoặc file cục bộ) thành ImageProvider
-ImageProvider getCustomImageProvider(String pathOrUrl) {
-  final trimmed = pathOrUrl.trim();
-  if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
-    return NetworkImage(trimmed);
-  } else if (trimmed.startsWith('data:image') ||
-      trimmed.startsWith('data:application')) {
-    try {
-      final base64Content = trimmed.split(',').last;
-      return MemoryImage(base64Decode(base64Content));
-    } catch (_) {
-      return NetworkImage(trimmed);
-    }
-  } else if (kIsWeb) {
-    return NetworkImage(trimmed);
-  } else {
-    return FileImage(File(trimmed));
   }
 }
 
@@ -76,8 +64,13 @@ class _HomeScreenState extends State<HomeScreen> {
   List<Task> _tasks = [];
   List<Habit> _habits = [];
 
-  // Tab: 0 = Cần làm, 1 = Đã hoàn thành
-  int _currentTabIndex = 0;
+  // Tab: 0 = Cần làm, 1 = Đã hoàn thành.
+  // Dùng ValueNotifier thay vì biến State + setState: onPageChanged nổ đúng
+  // lúc kéo tới giữa, nếu setState thì cả cây widget (gồm CẢ HAI tab với toàn
+  // bộ thẻ) bị dựng lại ngay giữa cú kéo -> khựng lại. Giờ chỉ thanh tab được
+  // dựng lại.
+  final ValueNotifier<int> _tabIndex = ValueNotifier<int>(0);
+  final PageController _pageController = PageController();
   Tag? _selectedFilterTag;
 
   List<Tag> _availableTags = [
@@ -152,13 +145,105 @@ class _HomeScreenState extends State<HomeScreen> {
     await _loadDataFromPrefs();
     // Khởi tạo sau khi đã load để callback chuyển ngày làm việc trên dữ liệu thật
     await DayTransitionService.instance.init(onNewDay: _handleNewDay);
+
+    // Gắn callback trước khi xử lý thông báo đã mở app
+    NotificationService.instance.onReminderOpened = _openReminderScreen;
+    await NotificationService.instance.handleLaunchFromNotification();
+
     await _syncExternal();
+  }
+
+  Task? _findTaskById(String id) {
+    for (final task in _tasks) {
+      if (task.id == id) return task;
+    }
+    return null;
+  }
+
+  Habit? _findHabitById(String id) {
+    for (final habit in _habits) {
+      if (habit.id == id) return habit;
+    }
+    return null;
+  }
+
+  /// Mở màn hình nhắc toàn khung với ảnh nền của chính card đó.
+  void _openReminderScreen(ReminderPayload payload) {
+    if (!mounted) return;
+
+    final navigator = appNavigatorKey.currentState;
+    if (navigator == null) return;
+
+    final ReminderScreen? screen;
+    if (payload.isTask) {
+      final task = _findTaskById(payload.id);
+      screen = task == null
+          ? null
+          : ReminderScreen(
+              title: task.title,
+              themeType: task.themeType,
+              customBg: task.customBackgroundImage,
+              reminderTime: task.reminderTime,
+              tags: task.tags,
+              subtitleInfo:
+                  'Hạn: ${DateFormat('dd/MM/yyyy').format(task.dueDate)}',
+              isLead: payload.isLead,
+              leadMinutes: kReminderLeadMinutes,
+              onComplete: () {
+                setState(() => task.isCompleted = true);
+                _persistAndSync(showFeedback: false);
+              },
+            );
+    } else {
+      final habit = _findHabitById(payload.id);
+      screen = habit == null
+          ? null
+          : ReminderScreen(
+              title: habit.title,
+              themeType: habit.themeType,
+              customBg: habit.customBackgroundImage,
+              reminderTime: habit.reminderTime,
+              tags: habit.tags,
+              subtitleInfo: 'Chuỗi: ${habit.streak} ngày',
+              isLead: payload.isLead,
+              leadMinutes: kReminderLeadMinutes,
+              completeLabel: 'Đã làm hôm nay',
+              onComplete: () {
+                setState(() {
+                  if (!habit.isCompletedToday) {
+                    habit.isCompletedToday = true;
+                    habit.streak++;
+                  }
+                });
+                _persistAndSync(showFeedback: false);
+              },
+            );
+    }
+
+    // Công việc đã bị xoá trước khi thông báo nổ
+    if (screen == null) return;
+
+    final ReminderScreen reminder = screen;
+    navigator.push(MaterialPageRoute<void>(builder: (_) => reminder));
   }
 
   @override
   void dispose() {
+    _tabIndex.dispose();
+    _pageController.dispose();
     DayTransitionService.instance.dispose();
     super.dispose();
+  }
+
+  /// Bấm vào thanh tab: chạy animation sang trang đó.
+  /// _tabIndex được cập nhật trong onPageChanged của PageView.
+  void _goToTab(int index) {
+    if (_tabIndex.value == index) return;
+    _pageController.animateToPage(
+      index,
+      duration: const Duration(milliseconds: 280),
+      curve: Curves.easeOutCubic,
+    );
   }
 
   /// Sang ngày mới: reset trạng thái thói quen trên danh sách đang giữ trong
@@ -301,11 +386,10 @@ class _HomeScreenState extends State<HomeScreen> {
     final bool ok = await _saveDataToPrefs();
     if (!ok) {
       if (mounted && showFeedback) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Lưu dữ liệu thất bại, vui lòng thử lại.'),
-            backgroundColor: Colors.red,
-          ),
+        AppToast.showIn(
+          Overlay.maybeOf(context),
+          message: 'Lưu dữ liệu thất bại, vui lòng thử lại.',
+          success: false,
         );
       }
       return;
@@ -345,8 +429,10 @@ class _HomeScreenState extends State<HomeScreen> {
     } catch (e) {
       debugPrint('Lỗi chọn ảnh từ thiết bị: $e');
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Không lấy được ảnh từ thiết bị.')),
+        AppToast.showIn(
+          Overlay.maybeOf(context),
+          message: 'Không lấy được ảnh từ thiết bị.',
+          success: false,
         );
       }
     }
@@ -549,8 +635,10 @@ class _HomeScreenState extends State<HomeScreen> {
                               ),
                               textStyle: const TextStyle(fontSize: 11),
                             ),
-                            icon: const Icon(Icons.add_photo_alternate,
-                                size: 15),
+                            icon: const Icon(
+                              Icons.add_photo_alternate,
+                              size: 15,
+                            ),
                             label: const Text('Thêm vào kho'),
                             onPressed: () {
                               _showAddBackgroundToLibraryDialog(() {
@@ -568,15 +656,16 @@ class _HomeScreenState extends State<HomeScreen> {
                           itemCount: _bgLibrary.length,
                           gridDelegate:
                               const SliverGridDelegateWithFixedCrossAxisCount(
-                            crossAxisCount: 2,
-                            childAspectRatio: 1.35,
-                            crossAxisSpacing: 10,
-                            mainAxisSpacing: 10,
-                          ),
+                                crossAxisCount: 2,
+                                childAspectRatio: 1.35,
+                                crossAxisSpacing: 10,
+                                mainAxisSpacing: 10,
+                              ),
                           itemBuilder: (context, index) {
                             final bgItem = _bgLibrary[index];
-                            final isCustom = !_defaultBgLibrary
-                                .any((item) => item.id == bgItem.id);
+                            final isCustom = !_defaultBgLibrary.any(
+                              (item) => item.id == bgItem.id,
+                            );
 
                             return InkWell(
                               borderRadius: BorderRadius.circular(16),
@@ -596,13 +685,14 @@ class _HomeScreenState extends State<HomeScreen> {
                                           bgItem.urlOrPath,
                                         ),
                                         fit: BoxFit.cover,
-                                        errorBuilder: (context, error, stackTrace) =>
-                                            const Center(
-                                          child: Icon(
-                                            Icons.broken_image,
-                                            color: Colors.white54,
-                                          ),
-                                        ),
+                                        errorBuilder:
+                                            (context, error, stackTrace) =>
+                                                const Center(
+                                                  child: Icon(
+                                                    Icons.broken_image,
+                                                    color: Colors.white54,
+                                                  ),
+                                                ),
                                       ),
                                     ),
                                     Container(
@@ -612,7 +702,9 @@ class _HomeScreenState extends State<HomeScreen> {
                                           end: Alignment.bottomCenter,
                                           colors: [
                                             Colors.transparent,
-                                            Colors.black.withValues(alpha: 0.75),
+                                            Colors.black.withValues(
+                                              alpha: 0.75,
+                                            ),
                                           ],
                                         ),
                                       ),
@@ -626,9 +718,12 @@ class _HomeScreenState extends State<HomeScreen> {
                                           vertical: 2,
                                         ),
                                         decoration: BoxDecoration(
-                                          color: Colors.black.withValues(alpha: 0.6),
-                                          borderRadius:
-                                              BorderRadius.circular(6),
+                                          color: Colors.black.withValues(
+                                            alpha: 0.6,
+                                          ),
+                                          borderRadius: BorderRadius.circular(
+                                            6,
+                                          ),
                                         ),
                                         child: Text(
                                           bgItem.category,
@@ -742,9 +837,11 @@ class _HomeScreenState extends State<HomeScreen> {
                             fit: BoxFit.cover,
                             errorBuilder: (context, error, stackTrace) =>
                                 const Center(
-                              child: Icon(Icons.broken_image,
-                                  color: Colors.white54),
-                            ),
+                                  child: Icon(
+                                    Icons.broken_image,
+                                    color: Colors.white54,
+                                  ),
+                                ),
                           ),
                         ),
                       ),
@@ -824,7 +921,8 @@ class _HomeScreenState extends State<HomeScreen> {
     DateTime tempDate = taskToEdit?.dueDate ?? _selectedDate;
     String themeType =
         taskToEdit?.themeType ?? habitToEdit?.themeType ?? 'default';
-    String customBg = taskToEdit?.customBackgroundImage ??
+    String customBg =
+        taskToEdit?.customBackgroundImage ??
         habitToEdit?.customBackgroundImage ??
         '';
 
@@ -844,13 +942,13 @@ class _HomeScreenState extends State<HomeScreen> {
     Tag? selectedTag = (taskToEdit?.tags.isNotEmpty == true)
         ? taskToEdit!.tags.first
         : ((habitToEdit?.tags.isNotEmpty == true)
-            ? habitToEdit!.tags.first
-            : (_availableTags.isNotEmpty ? _availableTags.first : null));
+              ? habitToEdit!.tags.first
+              : (_availableTags.isNotEmpty ? _availableTags.first : null));
 
     final titleController = TextEditingController(text: title);
-    // Lấy messenger từ context của State. Bên trong dialog, biến `context` bị
+    // Lấy Overlay từ context của State. Bên trong dialog, biến `context` bị
     // StatefulBuilder che mất và sẽ không dùng được nữa sau khi dialog đóng.
-    final messenger = ScaffoldMessenger.of(context);
+    final overlay = Overlay.maybeOf(context);
 
     showDialog(
       context: context,
@@ -858,7 +956,10 @@ class _HomeScreenState extends State<HomeScreen> {
         return StatefulBuilder(
           builder: (context, setStateDialog) {
             return AlertDialog(
-              insetPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 24),
+              insetPadding: const EdgeInsets.symmetric(
+                horizontal: 16,
+                vertical: 24,
+              ),
               shape: RoundedRectangleBorder(
                 borderRadius: BorderRadius.circular(24),
               ),
@@ -901,7 +1002,9 @@ class _HomeScreenState extends State<HomeScreen> {
                         filled: true,
                         fillColor: Colors.grey.shade50,
                         contentPadding: const EdgeInsets.symmetric(
-                            horizontal: 12, vertical: 8),
+                          horizontal: 12,
+                          vertical: 8,
+                        ),
                         border: OutlineInputBorder(
                           borderRadius: BorderRadius.circular(12),
                           borderSide: BorderSide.none,
@@ -953,8 +1056,10 @@ class _HomeScreenState extends State<HomeScreen> {
                             visualDensity: VisualDensity.compact,
                           ),
                           icon: const Icon(Icons.add_circle_outline, size: 15),
-                          label: const Text('Tạo nhãn',
-                              style: TextStyle(fontSize: 12)),
+                          label: const Text(
+                            'Tạo nhãn',
+                            style: TextStyle(fontSize: 12),
+                          ),
                           onPressed: () {
                             _showCreateTagDialog((newTag) {
                               setStateDialog(() {
@@ -984,8 +1089,8 @@ class _HomeScreenState extends State<HomeScreen> {
                           ),
                           selected: isSelected,
                           selectedColor: Color(tag.colorValue),
-                          backgroundColor:
-                              Color(tag.colorValue).withValues(alpha: 0.15),
+                          backgroundColor: Color(tag.colorValue)
+                              .withValues(alpha: 0.15),
                           checkmarkColor: Colors.white,
                           onSelected: (selected) {
                             setStateDialog(() {
@@ -1021,8 +1126,10 @@ class _HomeScreenState extends State<HomeScreen> {
                                 customBg = '';
                               });
                             },
-                            child: const Text('Xóa nền',
-                                style: TextStyle(fontSize: 12)),
+                            child: const Text(
+                              'Xóa nền',
+                              style: TextStyle(fontSize: 12),
+                            ),
                           ),
                       ],
                     ),
@@ -1068,21 +1175,28 @@ class _HomeScreenState extends State<HomeScreen> {
                               foregroundColor: Colors.deepPurple,
                               elevation: 0,
                               padding: const EdgeInsets.symmetric(
-                                  vertical: 10, horizontal: 4),
+                                vertical: 10,
+                                horizontal: 4,
+                              ),
                               shape: RoundedRectangleBorder(
                                 borderRadius: BorderRadius.circular(12),
                                 side: BorderSide(
-                                    color: Colors.deepPurple.shade200),
+                                  color: Colors.deepPurple.shade200,
+                                ),
                               ),
                             ),
-                            icon: const Icon(Icons.add_photo_alternate,
-                                size: 16),
+                            icon: const Icon(
+                              Icons.add_photo_alternate,
+                              size: 16,
+                            ),
                             label: const FittedBox(
                               fit: BoxFit.scaleDown,
                               child: Text(
                                 'Lấy ảnh từ máy',
                                 style: TextStyle(
-                                    fontWeight: FontWeight.bold, fontSize: 12),
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 12,
+                                ),
                               ),
                             ),
                             onPressed: () {
@@ -1099,13 +1213,17 @@ class _HomeScreenState extends State<HomeScreen> {
                           child: OutlinedButton.icon(
                             style: OutlinedButton.styleFrom(
                               padding: const EdgeInsets.symmetric(
-                                  vertical: 10, horizontal: 4),
+                                vertical: 10,
+                                horizontal: 4,
+                              ),
                               shape: RoundedRectangleBorder(
                                 borderRadius: BorderRadius.circular(12),
                               ),
                             ),
-                            icon: const Icon(Icons.photo_library_outlined,
-                                size: 16),
+                            icon: const Icon(
+                              Icons.photo_library_outlined,
+                              size: 16,
+                            ),
                             label: const FittedBox(
                               fit: BoxFit.scaleDown,
                               child: Text(
@@ -1172,10 +1290,11 @@ class _HomeScreenState extends State<HomeScreen> {
                             },
                             child: Container(
                               padding: const EdgeInsets.symmetric(
-                                  horizontal: 8, vertical: 8),
+                                horizontal: 8,
+                                vertical: 8,
+                              ),
                               decoration: BoxDecoration(
-                                border:
-                                    Border.all(color: Colors.grey.shade300),
+                                border: Border.all(color: Colors.grey.shade300),
                                 borderRadius: BorderRadius.circular(12),
                               ),
                               child: Row(
@@ -1237,10 +1356,11 @@ class _HomeScreenState extends State<HomeScreen> {
                             },
                             child: Container(
                               padding: const EdgeInsets.symmetric(
-                                  horizontal: 8, vertical: 8),
+                                horizontal: 8,
+                                vertical: 8,
+                              ),
                               decoration: BoxDecoration(
-                                border:
-                                    Border.all(color: Colors.grey.shade300),
+                                border: Border.all(color: Colors.grey.shade300),
                                 borderRadius: BorderRadius.circular(12),
                               ),
                               child: Row(
@@ -1367,19 +1487,14 @@ class _HomeScreenState extends State<HomeScreen> {
                       Navigator.pop(dialogContext);
 
                       final bool saved = await _saveDataToPrefs();
-                      messenger.showSnackBar(
-                        SnackBar(
-                          duration: const Duration(seconds: 2),
-                          backgroundColor:
-                              saved ? Colors.green.shade700 : Colors.red,
-                          content: Text(
-                            saved
-                                ? (isEditing
-                                    ? 'Đã lưu thay đổi ✅'
-                                    : 'Đã tạo công việc mới ✅')
-                                : 'Lưu dữ liệu thất bại, vui lòng thử lại.',
-                          ),
-                        ),
+                      AppToast.showIn(
+                        overlay,
+                        message: saved
+                            ? (isEditing
+                                  ? 'Đã lưu thay đổi'
+                                  : 'Đã tạo công việc mới')
+                            : 'Lưu dữ liệu thất bại, vui lòng thử lại.',
+                        success: saved,
                       );
                       if (saved) await _syncExternal();
                     }
@@ -1395,6 +1510,87 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   // Card hiển thị linh hoạt: Ưu tiên Custom Bg -> Theme Type -> Mặc định
+  /// Menu Sửa / Xoá cho một thẻ.
+  ///
+  /// Trước đây xoá bằng cách kéo thẻ sang trái (Dismissible), nhưng giờ cử chỉ
+  /// kéo ngang đã dành cho việc chuyển tab, nên chuyển sang menu này.
+  void _showItemActions({
+    required String title,
+    required VoidCallback onEdit,
+    required VoidCallback onDelete,
+  }) {
+    showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: Colors.white,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      builder: (sheetContext) {
+        return SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const SizedBox(height: 12),
+              Container(
+                width: 40,
+                height: 4,
+                decoration: BoxDecoration(
+                  color: Colors.grey.shade300,
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+              const SizedBox(height: 14),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 20),
+                child: Text(
+                  title,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                    fontWeight: FontWeight.bold,
+                    fontSize: 15,
+                  ),
+                ),
+              ),
+              const SizedBox(height: 8),
+              ListTile(
+                leading: const Icon(
+                  Icons.edit_outlined,
+                  color: Colors.deepPurple,
+                ),
+                title: const Text('Sửa hoạt động'),
+                onTap: () {
+                  Navigator.pop(sheetContext);
+                  onEdit();
+                },
+              ),
+              ListTile(
+                leading: const Icon(
+                  Icons.delete_outline,
+                  color: Colors.redAccent,
+                ),
+                title: const Text(
+                  'Xoá',
+                  style: TextStyle(color: Colors.redAccent),
+                ),
+                onTap: () {
+                  Navigator.pop(sheetContext);
+                  onDelete();
+                  AppToast.showIn(
+                    Overlay.maybeOf(context),
+                    message: 'Đã xoá "$title"',
+                  );
+                },
+              ),
+              const SizedBox(height: 8),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
   Widget buildThemedCard({
     required String title,
     required String themeType,
@@ -1406,6 +1602,10 @@ class _HomeScreenState extends State<HomeScreen> {
     required String? reminderTime,
     required List<Tag> tags,
     required String subtitleInfo,
+    // Tab "Đã hoàn thành" mới có nút khôi phục. Truyền vào thay vì đọc
+    // _tabIndex, vì cả 2 tab được dựng cùng lúc trong PageView.
+    required bool showUndo,
+    required VoidCallback onDelete,
   }) {
     final bool hasCustomBg = customBg != null && customBg.trim().isNotEmpty;
     final bool isThemed = themeType != 'default';
@@ -1450,10 +1650,10 @@ class _HomeScreenState extends State<HomeScreen> {
         color: hasCustomBg
             ? const Color(0xFF1E1E2C)
             : (isThemed
-                ? null
-                : (isCompleted
-                    ? Colors.deepPurple.withValues(alpha: 0.08)
-                    : Colors.white)),
+                  ? null
+                  : (isCompleted
+                        ? Colors.deepPurple.withValues(alpha: 0.08)
+                        : Colors.white)),
         gradient: hasCustomBg ? null : (isThemed ? cardGradient : null),
         image: hasCustomBg
             ? DecorationImage(
@@ -1471,11 +1671,11 @@ class _HomeScreenState extends State<HomeScreen> {
         border: Border.all(
           color: isCompleted
               ? (isDarkCard
-                  ? Colors.amberAccent.withValues(alpha: 0.6)
-                  : Colors.deepPurple.shade300)
+                    ? Colors.amberAccent.withValues(alpha: 0.6)
+                    : Colors.deepPurple.shade300)
               : (hasCustomBg
-                  ? Colors.white.withValues(alpha: 0.15)
-                  : Colors.transparent),
+                    ? Colors.white.withValues(alpha: 0.15)
+                    : Colors.transparent),
           width: 1.5,
         ),
         boxShadow: [
@@ -1492,7 +1692,11 @@ class _HomeScreenState extends State<HomeScreen> {
           color: Colors.transparent,
           child: InkWell(
             onTap: onTap,
-            onLongPress: onEdit,
+            onLongPress: () => _showItemActions(
+              title: title,
+              onEdit: onEdit,
+              onDelete: onDelete,
+            ),
             child: Padding(
               padding: const EdgeInsets.all(16),
               child: Row(
@@ -1503,20 +1707,20 @@ class _HomeScreenState extends State<HomeScreen> {
                       color: isDarkCard
                           ? Colors.black.withValues(alpha: 0.35)
                           : (isCompleted
-                              ? Colors.deepPurple
-                              : Colors.deepPurple.shade50),
+                                ? Colors.deepPurple
+                                : Colors.deepPurple.shade50),
                       borderRadius: BorderRadius.circular(14),
                     ),
                     child: Icon(
                       isCompleted
                           ? Icons.undo
                           : (themeType == 'game'
-                              ? Icons.local_fire_department
-                              : (themeType == 'sport'
-                                  ? Icons.sports_soccer
-                                  : (hasCustomBg
-                                      ? Icons.auto_awesome
-                                      : Icons.task_alt))),
+                                ? Icons.local_fire_department
+                                : (themeType == 'sport'
+                                      ? Icons.sports_soccer
+                                      : (hasCustomBg
+                                            ? Icons.auto_awesome
+                                            : Icons.task_alt))),
                       color: isDarkCard
                           ? accentColor
                           : (isCompleted ? Colors.white : Colors.deepPurple),
@@ -1550,8 +1754,8 @@ class _HomeScreenState extends State<HomeScreen> {
                             color: isDarkCard
                                 ? Colors.white
                                 : (isCompleted
-                                    ? Colors.deepPurple
-                                    : Colors.black87),
+                                      ? Colors.deepPurple
+                                      : Colors.black87),
                           ),
                         ),
                         const SizedBox(height: 6),
@@ -1608,8 +1812,9 @@ class _HomeScreenState extends State<HomeScreen> {
                       ],
                     ),
                   ),
-                  if (_currentTabIndex == 1)
+                  if (showUndo)
                     IconButton(
+                      visualDensity: VisualDensity.compact,
                       icon: Icon(
                         Icons.undo,
                         color: isDarkCard ? Colors.white : Colors.deepPurple,
@@ -1618,6 +1823,20 @@ class _HomeScreenState extends State<HomeScreen> {
                       tooltip: 'Khôi phục lại',
                       onPressed: onUndo,
                     ),
+                  IconButton(
+                    visualDensity: VisualDensity.compact,
+                    icon: Icon(
+                      Icons.more_vert,
+                      color: isDarkCard ? Colors.white70 : Colors.grey.shade600,
+                      size: 20,
+                    ),
+                    tooltip: 'Sửa hoặc xoá',
+                    onPressed: () => _showItemActions(
+                      title: title,
+                      onEdit: onEdit,
+                      onDelete: onDelete,
+                    ),
+                  ),
                 ],
               ),
             ),
@@ -1632,33 +1851,6 @@ class _HomeScreenState extends State<HomeScreen> {
     if (_isLoading) {
       return const Scaffold(body: Center(child: CircularProgressIndicator()));
     }
-
-    final filteredTasks = _tasks.where((task) {
-      final matchTag = _selectedFilterTag == null ||
-          task.tags.any((t) => t.id == _selectedFilterTag!.id);
-      final matchDate = task.dueDate.year == _selectedDate.year &&
-          task.dueDate.month == _selectedDate.month &&
-          task.dueDate.day == _selectedDate.day;
-
-      if (_currentTabIndex == 0) {
-        return matchDate && matchTag && !task.isCompleted;
-      } else {
-        return matchDate && matchTag && task.isCompleted;
-      }
-    }).toList();
-
-    if (_currentTabIndex == 1) {
-      filteredTasks.sort((a, b) => b.dueDate.compareTo(a.dueDate));
-    }
-
-    final filteredHabits = _habits.where((habit) {
-      final matchTag = _selectedFilterTag == null ||
-          habit.tags.any((t) => t.id == _selectedFilterTag!.id);
-      return matchTag &&
-          (_currentTabIndex == 0
-              ? !habit.isCompletedToday
-              : habit.isCompletedToday);
-    }).toList();
 
     return Scaffold(
       backgroundColor: Colors.grey.shade50,
@@ -1689,324 +1881,34 @@ class _HomeScreenState extends State<HomeScreen> {
           ),
         ],
       ),
-      body: ListView(
-        padding: const EdgeInsets.all(16.0),
+      // Header cố định ở trên, hai tab kéo qua kéo lại ở dưới
+      body: Column(
         children: [
-          // =========================================================================
-          // BANNER NGÀY THÁNG CỐ ĐỊNH Ở ĐẦU TRANG (LUÔN HIỂN THỊ Ở CẢ 2 TAB CẦN LÀM / ĐÃ XONG)
-          // =========================================================================
-          Container(
-            padding: const EdgeInsets.all(14),
-            decoration: BoxDecoration(
-              gradient: LinearGradient(
-                colors: [
-                  Colors.deepPurple.shade50,
-                  Colors.deepPurple.shade100.withValues(alpha: 0.5),
-                ],
-              ),
-              borderRadius: BorderRadius.circular(16),
-            ),
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
+            child: Column(
               children: [
-                Expanded(
-                  child: Row(
-                    children: [
-                      const Icon(
-                        Icons.today,
-                        color: Colors.deepPurple,
-                        size: 20,
-                      ),
-                      const SizedBox(width: 8),
-                      Flexible(
-                        child: Text(
-                          'Ngày: ${DateFormat('dd/MM/yyyy').format(_selectedDate)}',
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
-                            fontWeight: FontWeight.bold,
-                            color: Colors.deepPurple,
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
+                _buildDateBanner(),
+                const SizedBox(height: 16),
+                // Chỉ phần này nghe _tabIndex, nên kéo tab không làm
+                // dựng lại danh sách thẻ
+                ValueListenableBuilder<int>(
+                  valueListenable: _tabIndex,
+                  builder: (_, tabIndex, _) => _buildTabBar(tabIndex),
                 ),
-                const SizedBox(width: 8),
-                TextButton(
-                  style: TextButton.styleFrom(
-                    backgroundColor: Colors.white,
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 12,
-                      vertical: 6,
-                    ),
-                  ),
-                  onPressed: () =>
-                      setState(() => _selectedDate = DateTime.now()),
-                  child: const Text(
-                    'Hôm nay',
-                    style: TextStyle(
-                      fontSize: 12,
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-                ),
+                const SizedBox(height: 16),
+                _buildTagFilter(),
               ],
             ),
           ),
-          const SizedBox(height: 16),
-
-          // ==========================================
-          // THANH CHUYỂN TAB NẰM CỐ ĐỊNH PHÍA TRÊN
-          // ==========================================
-          Container(
-            padding: const EdgeInsets.all(4),
-            decoration: BoxDecoration(
-              color: Colors.grey.shade200,
-              borderRadius: BorderRadius.circular(16),
-            ),
-            child: Row(
-              children: [
-                Expanded(
-                  child: GestureDetector(
-                    onTap: () => setState(() => _currentTabIndex = 0),
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(vertical: 12),
-                      alignment: Alignment.center,
-                      decoration: BoxDecoration(
-                        color: _currentTabIndex == 0
-                            ? Colors.white
-                            : Colors.transparent,
-                        borderRadius: BorderRadius.circular(12),
-                      ),
-                      child: Text(
-                        'Cần làm',
-                        style: TextStyle(
-                          fontWeight: FontWeight.bold,
-                          color: _currentTabIndex == 0
-                            ? Colors.deepPurple
-                            : Colors.grey.shade600,
-                        ),
-                      ),
-                    ),
-                  ),
-                ),
-                Expanded(
-                  child: GestureDetector(
-                    onTap: () => setState(() => _currentTabIndex = 1),
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(vertical: 12),
-                      alignment: Alignment.center,
-                      decoration: BoxDecoration(
-                        color: _currentTabIndex == 1
-                            ? Colors.white
-                            : Colors.transparent,
-                        borderRadius: BorderRadius.circular(12),
-                      ),
-                      child: Text(
-                        'Đã hoàn thành',
-                        style: TextStyle(
-                          fontWeight: FontWeight.bold,
-                          color: _currentTabIndex == 1
-                            ? Colors.deepPurple
-                            : Colors.grey.shade600,
-                        ),
-                      ),
-                    ),
-                  ),
-                ),
-              ],
+          Expanded(
+            child: PageView(
+              controller: _pageController,
+              // KHÔNG setState ở đây - xem ghi chú ở _tabIndex
+              onPageChanged: (index) => _tabIndex.value = index,
+              children: [_buildTabContent(0), _buildTabContent(1)],
             ),
           ),
-          const SizedBox(height: 16),
-
-          // Thanh lọc theo nhãn dán (Tag filter)
-          SingleChildScrollView(
-            scrollDirection: Axis.horizontal,
-            child: Row(
-              children: [
-                FilterChip(
-                  label: const Text('Tất cả'),
-                  selected: _selectedFilterTag == null,
-                  onSelected: (bool selected) =>
-                      setState(() => _selectedFilterTag = null),
-                ),
-                const SizedBox(width: 8),
-                ..._availableTags.map((tag) {
-                  final isSelected = _selectedFilterTag?.id == tag.id;
-                  return Padding(
-                    padding: const EdgeInsets.only(right: 8),
-                    child: FilterChip(
-                      label: Text(tag.name),
-                      selected: isSelected,
-                      selectedColor: Color(tag.colorValue).withValues(alpha: 0.3),
-                      checkmarkColor: Color(tag.colorValue),
-                      onSelected: (bool selected) => setState(
-                        () => _selectedFilterTag = selected ? tag : null,
-                      ),
-                    ),
-                  );
-                }),
-              ],
-            ),
-          ),
-          const SizedBox(height: 20),
-
-          // --- THÓI QUEN ---
-          const Text(
-            '🔥 Thói Quen Hàng Ngày',
-            style: TextStyle(
-              fontSize: 16,
-              fontWeight: FontWeight.bold,
-              color: Colors.deepOrange,
-            ),
-          ),
-          const SizedBox(height: 10),
-          filteredHabits.isEmpty
-              ? Padding(
-                  padding: const EdgeInsets.symmetric(vertical: 10),
-                  child: Text(
-                    _currentTabIndex == 0
-                        ? 'Không có thói quen nào cần làm.'
-                        : 'Chưa có thói quen nào hoàn thành.',
-                    style: TextStyle(color: Colors.grey.shade500, fontSize: 13),
-                  ),
-                )
-              : Column(
-                  children: filteredHabits
-                      .map(
-                        (habit) => Dismissible(
-                          key: Key(habit.id),
-                          direction: DismissDirection.endToStart,
-                          background: Container(
-                            alignment: Alignment.centerRight,
-                            padding: const EdgeInsets.only(right: 20),
-                            margin: const EdgeInsets.only(bottom: 12),
-                            decoration: BoxDecoration(
-                              color: Colors.red.shade400,
-                              borderRadius: BorderRadius.circular(16),
-                            ),
-                            child: const Icon(
-                              Icons.delete,
-                              color: Colors.white,
-                            ),
-                          ),
-                          onDismissed: (_) {
-                            setState(() => _habits.remove(habit));
-                            _persistAndSync();
-                          },
-                          child: buildThemedCard(
-                            title: habit.title,
-                            themeType: habit.themeType,
-                            customBg: habit.customBackgroundImage,
-                            isCompleted: habit.isCompletedToday,
-                            reminderTime: habit.reminderTime,
-                            tags: habit.tags,
-                            subtitleInfo: 'Chuỗi: ${habit.streak} ngày',
-                            onTap: () {
-                              setState(() {
-                                habit.isCompletedToday =
-                                    !habit.isCompletedToday;
-                                if (habit.isCompletedToday) {
-                                  habit.streak++;
-                                } else {
-                                  habit.streak = habit.streak > 0
-                                      ? habit.streak - 1
-                                      : 0;
-                                }
-                              });
-                              _persistAndSync();
-                            },
-                            onUndo: () {
-                              setState(() {
-                                habit.isCompletedToday = false;
-                                habit.streak = habit.streak > 0
-                                    ? habit.streak - 1
-                                    : 0;
-                              });
-                              _persistAndSync();
-                            },
-                            onEdit: () => _showItemDialog(habitToEdit: habit),
-                          ),
-                        ),
-                      )
-                      .toList(),
-                ),
-
-          const SizedBox(height: 16),
-
-          // --- CÔNG VIỆC ---
-          Text(
-            _currentTabIndex == 0
-                ? '📋 Công Việc Cần Làm (${filteredTasks.length})'
-                : '✅ Công Việc Đã Hoàn Thành (${filteredTasks.length})',
-            style: const TextStyle(
-              fontSize: 16,
-              fontWeight: FontWeight.bold,
-              color: Colors.deepPurple,
-            ),
-          ),
-          const SizedBox(height: 10),
-          filteredTasks.isEmpty
-              ? Padding(
-                  padding: const EdgeInsets.symmetric(vertical: 20),
-                  child: Center(
-                    child: Text(
-                      _currentTabIndex == 0
-                          ? 'Không có công việc nào cần làm trong ngày này.'
-                          : 'Chưa có công việc nào hoàn thành trong ngày này.',
-                      style: TextStyle(color: Colors.grey.shade500),
-                    ),
-                  ),
-                )
-              : Column(
-                  children: filteredTasks
-                      .map(
-                        (task) => Dismissible(
-                          key: Key(task.id),
-                          direction: DismissDirection.endToStart,
-                          background: Container(
-                            alignment: Alignment.centerRight,
-                            padding: const EdgeInsets.only(right: 20),
-                            margin: const EdgeInsets.only(bottom: 12),
-                            decoration: BoxDecoration(
-                              color: Colors.red.shade400,
-                              borderRadius: BorderRadius.circular(16),
-                            ),
-                            child: const Icon(
-                              Icons.delete,
-                              color: Colors.white,
-                            ),
-                          ),
-                          onDismissed: (_) {
-                            setState(() => _tasks.remove(task));
-                            _persistAndSync();
-                          },
-                          child: buildThemedCard(
-                            title: task.title,
-                            themeType: task.themeType,
-                            customBg: task.customBackgroundImage,
-                            isCompleted: task.isCompleted,
-                            reminderTime: task.reminderTime,
-                            tags: task.tags,
-                            subtitleInfo: _currentTabIndex == 1
-                                ? '📅 ${DateFormat('dd/MM/yyyy').format(task.dueDate)}'
-                                : 'Hạn: ${DateFormat('dd/MM/yyyy').format(task.dueDate)}',
-                            onTap: () {
-                              setState(
-                                () => task.isCompleted = !task.isCompleted,
-                              );
-                              _persistAndSync();
-                            },
-                            onUndo: () {
-                              setState(() => task.isCompleted = false);
-                              _persistAndSync();
-                            },
-                            onEdit: () => _showItemDialog(taskToEdit: task),
-                          ),
-                        ),
-                      )
-                      .toList(),
-                ),
         ],
       ),
       floatingActionButton: FloatingActionButton.extended(
@@ -2019,6 +1921,299 @@ class _HomeScreenState extends State<HomeScreen> {
           style: TextStyle(fontWeight: FontWeight.bold),
         ),
       ),
+    );
+  }
+
+  // ===========================================================================
+  // CÁC PHẦN CỦA HEADER CỐ ĐỊNH
+  // ===========================================================================
+
+  /// Banner ngày tháng, luôn hiển thị ở cả 2 tab.
+  Widget _buildDateBanner() {
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          colors: [
+            Colors.deepPurple.shade50,
+            Colors.deepPurple.shade100.withValues(alpha: 0.5),
+          ],
+        ),
+        borderRadius: BorderRadius.circular(16),
+      ),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          Expanded(
+            child: Row(
+              children: [
+                const Icon(Icons.today, color: Colors.deepPurple, size: 20),
+                const SizedBox(width: 8),
+                Flexible(
+                  child: Text(
+                    'Ngày: ${DateFormat('dd/MM/yyyy').format(_selectedDate)}',
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      fontWeight: FontWeight.bold,
+                      color: Colors.deepPurple,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 8),
+          TextButton(
+            style: TextButton.styleFrom(
+              backgroundColor: Colors.white,
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+            ),
+            onPressed: () => setState(() => _selectedDate = DateTime.now()),
+            child: const Text(
+              'Hôm nay',
+              style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Thanh chuyển tab. Bấm thì chạy animation sang trang tương ứng, còn kéo
+  /// ngang trên nội dung thì PageView tự đổi và onPageChanged cập nhật lại đây.
+  Widget _buildTabBar(int currentTab) {
+    return Container(
+      padding: const EdgeInsets.all(4),
+      decoration: BoxDecoration(
+        color: Colors.grey.shade200,
+        borderRadius: BorderRadius.circular(16),
+      ),
+      child: Row(
+        children: [
+          _buildTabButton(
+            index: 0,
+            label: 'Cần làm',
+            isActive: currentTab == 0,
+          ),
+          _buildTabButton(
+            index: 1,
+            label: 'Đã hoàn thành',
+            isActive: currentTab == 1,
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildTabButton({
+    required int index,
+    required String label,
+    required bool isActive,
+  }) {
+    return Expanded(
+      child: GestureDetector(
+        onTap: () => _goToTab(index),
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 220),
+          curve: Curves.easeOut,
+          padding: const EdgeInsets.symmetric(vertical: 12),
+          alignment: Alignment.center,
+          decoration: BoxDecoration(
+            color: isActive ? Colors.white : Colors.transparent,
+            borderRadius: BorderRadius.circular(12),
+          ),
+          child: Text(
+            label,
+            style: TextStyle(
+              fontWeight: FontWeight.bold,
+              color: isActive ? Colors.deepPurple : Colors.grey.shade600,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// Thanh lọc theo nhãn dán (Tag filter)
+  Widget _buildTagFilter() {
+    return SingleChildScrollView(
+      scrollDirection: Axis.horizontal,
+      child: Row(
+        children: [
+          FilterChip(
+            label: const Text('Tất cả'),
+            selected: _selectedFilterTag == null,
+            onSelected: (bool selected) =>
+                setState(() => _selectedFilterTag = null),
+          ),
+          const SizedBox(width: 8),
+          ..._availableTags.map((tag) {
+            final isSelected = _selectedFilterTag?.id == tag.id;
+            return Padding(
+              padding: const EdgeInsets.only(right: 8),
+              child: FilterChip(
+                label: Text(tag.name),
+                selected: isSelected,
+                selectedColor: Color(tag.colorValue).withValues(alpha: 0.3),
+                checkmarkColor: Color(tag.colorValue),
+                onSelected: (bool selected) =>
+                    setState(() => _selectedFilterTag = selected ? tag : null),
+              ),
+            );
+          }),
+        ],
+      ),
+    );
+  }
+
+  // ===========================================================================
+  // NỘI DUNG CỦA MỖI TAB
+  // ===========================================================================
+
+  Widget _buildTabContent(int tabIndex) {
+    final bool completedTab = tabIndex == 1;
+
+    final filteredTasks = _tasks.where((task) {
+      final matchTag =
+          _selectedFilterTag == null ||
+          task.tags.any((t) => t.id == _selectedFilterTag!.id);
+      final matchDate =
+          task.dueDate.year == _selectedDate.year &&
+          task.dueDate.month == _selectedDate.month &&
+          task.dueDate.day == _selectedDate.day;
+      return matchDate &&
+          matchTag &&
+          (completedTab ? task.isCompleted : !task.isCompleted);
+    }).toList();
+
+    if (completedTab) {
+      filteredTasks.sort((a, b) => b.dueDate.compareTo(a.dueDate));
+    }
+
+    final filteredHabits = _habits.where((habit) {
+      final matchTag =
+          _selectedFilterTag == null ||
+          habit.tags.any((t) => t.id == _selectedFilterTag!.id);
+      return matchTag &&
+          (completedTab ? habit.isCompletedToday : !habit.isCompletedToday);
+    }).toList();
+
+    return ListView(
+      // Chừa chỗ dưới cùng để nút "Thêm mới" không che thẻ cuối
+      padding: const EdgeInsets.fromLTRB(16, 20, 16, 96),
+      children: [
+        // --- THÓI QUEN ---
+        const Text(
+          '🔥 Thói Quen Hàng Ngày',
+          style: TextStyle(
+            fontSize: 16,
+            fontWeight: FontWeight.bold,
+            color: Colors.deepOrange,
+          ),
+        ),
+        const SizedBox(height: 10),
+        if (filteredHabits.isEmpty)
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 10),
+            child: Text(
+              completedTab
+                  ? 'Chưa có thói quen nào hoàn thành.'
+                  : 'Không có thói quen nào cần làm.',
+              style: TextStyle(color: Colors.grey.shade500, fontSize: 13),
+            ),
+          )
+        else
+          ...filteredHabits.map(
+            (habit) => buildThemedCard(
+              title: habit.title,
+              themeType: habit.themeType,
+              customBg: habit.customBackgroundImage,
+              isCompleted: habit.isCompletedToday,
+              reminderTime: habit.reminderTime,
+              tags: habit.tags,
+              subtitleInfo: 'Chuỗi: ${habit.streak} ngày',
+              onTap: () {
+                setState(() {
+                  habit.isCompletedToday = !habit.isCompletedToday;
+                  if (habit.isCompletedToday) {
+                    habit.streak++;
+                  } else {
+                    habit.streak = habit.streak > 0 ? habit.streak - 1 : 0;
+                  }
+                });
+                _persistAndSync();
+              },
+              onUndo: () {
+                setState(() {
+                  habit.isCompletedToday = false;
+                  habit.streak = habit.streak > 0 ? habit.streak - 1 : 0;
+                });
+                _persistAndSync();
+              },
+              onEdit: () => _showItemDialog(habitToEdit: habit),
+              showUndo: completedTab,
+              onDelete: () {
+                setState(() => _habits.remove(habit));
+                _persistAndSync();
+              },
+            ),
+          ),
+
+        const SizedBox(height: 16),
+
+        // --- CÔNG VIỆC ---
+        Text(
+          completedTab
+              ? '✅ Công Việc Đã Hoàn Thành (${filteredTasks.length})'
+              : '📋 Công Việc Cần Làm (${filteredTasks.length})',
+          style: const TextStyle(
+            fontSize: 16,
+            fontWeight: FontWeight.bold,
+            color: Colors.deepPurple,
+          ),
+        ),
+        const SizedBox(height: 10),
+        if (filteredTasks.isEmpty)
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 20),
+            child: Center(
+              child: Text(
+                completedTab
+                    ? 'Chưa có công việc nào hoàn thành trong ngày này.'
+                    : 'Không có công việc nào cần làm trong ngày này.',
+                style: TextStyle(color: Colors.grey.shade500),
+              ),
+            ),
+          )
+        else
+          ...filteredTasks.map(
+            (task) => buildThemedCard(
+              title: task.title,
+              themeType: task.themeType,
+              customBg: task.customBackgroundImage,
+              isCompleted: task.isCompleted,
+              reminderTime: task.reminderTime,
+              tags: task.tags,
+              subtitleInfo: completedTab
+                  ? '📅 ${DateFormat('dd/MM/yyyy').format(task.dueDate)}'
+                  : 'Hạn: ${DateFormat('dd/MM/yyyy').format(task.dueDate)}',
+              onTap: () {
+                setState(() => task.isCompleted = !task.isCompleted);
+                _persistAndSync();
+              },
+              onUndo: () {
+                setState(() => task.isCompleted = false);
+                _persistAndSync();
+              },
+              onEdit: () => _showItemDialog(taskToEdit: task),
+              showUndo: completedTab,
+              onDelete: () {
+                setState(() => _tasks.remove(task));
+                _persistAndSync();
+              },
+            ),
+          ),
+      ],
     );
   }
 }
