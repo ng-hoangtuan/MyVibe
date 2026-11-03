@@ -1,25 +1,39 @@
-import 'dart:convert';
-
 import 'package:flutter/widgets.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-import '../models/task_habit_model.dart';
-
+/// Phát hiện app bước sang ngày mới (mở lại app, hoặc qua 00:00).
+///
+/// Service này KHÔNG tự ghi dữ liệu thói quen nữa. Trước đây nó vừa ghi
+/// `saved_habits` xuống prefs trong khi màn hình chính cũng đang đọc/ghi cùng
+/// key đó, nên hai bên ghi đè lẫn nhau và làm mất dữ liệu. Giờ nó chỉ báo
+/// "đã sang ngày mới" và để màn hình chính - nơi duy nhất giữ danh sách - tự
+/// cập nhật rồi lưu lại.
 class DayTransitionService with WidgetsBindingObserver {
   static final DayTransitionService instance = DayTransitionService._internal();
   DayTransitionService._internal();
 
-  // Callback để thông báo cho UI reload lại dữ liệu khi phát hiện sang ngày mới
-  Function()? onNewDayDetected;
+  static const String _lastActiveKey = 'last_active_date';
 
-  void init({Function()? onNewDay}) {
+  /// Callback để màn hình chính reset thói quen + reload dữ liệu.
+  Future<void> Function()? onNewDayDetected;
+
+  bool _observerAdded = false;
+  bool _running = false;
+
+  Future<void> init({Future<void> Function()? onNewDay}) async {
     onNewDayDetected = onNewDay;
-    WidgetsBinding.instance.addObserver(this);
-    checkAndProcessNewDay();
+    if (!_observerAdded) {
+      WidgetsBinding.instance.addObserver(this);
+      _observerAdded = true;
+    }
+    await checkAndProcessNewDay();
   }
 
   void dispose() {
-    WidgetsBinding.instance.removeObserver(this);
+    if (_observerAdded) {
+      WidgetsBinding.instance.removeObserver(this);
+      _observerAdded = false;
+    }
   }
 
   @override
@@ -31,64 +45,34 @@ class DayTransitionService with WidgetsBindingObserver {
   }
 
   Future<void> checkAndProcessNewDay() async {
-    final prefs = await SharedPreferences.getInstance();
+    // Chặn chạy chồng nhau (lifecycle resume có thể bắn liên tiếp)
+    if (_running) return;
+    _running = true;
+    try {
+      final SharedPreferences prefs = await SharedPreferences.getInstance();
 
-    final lastActiveDateStr = prefs.getString('last_active_date');
-    final now = DateTime.now();
-    final todayStr = _getDateString(now);
+      final String? lastActiveDateStr = prefs.getString(_lastActiveKey);
+      final String todayStr = _getDateString(DateTime.now());
 
-    if (lastActiveDateStr != null && lastActiveDateStr != todayStr) {
-      // === PHÁT HIỆN ĐÃ SANG NGÀY MỚI ===
-      final lastDate = DateTime.tryParse(lastActiveDateStr);
-      final isConsecutiveDay =
-          lastDate != null &&
-          now
-                  .difference(
-                    DateTime(lastDate.year, lastDate.month, lastDate.day),
-                  )
-                  .inDays ==
-              1;
+      if (lastActiveDateStr == todayStr) return;
+
+      // Ghi ngày mới NGAY để lần gọi tiếp theo không xử lý lại lần hai
+      await prefs.setString(_lastActiveKey, todayStr);
+
+      // Lần chạy đầu tiên của app thì không coi là "chuyển ngày"
+      if (lastActiveDateStr == null) return;
 
       debugPrint('Chuyển ngày từ $lastActiveDateStr sang $todayStr');
-
-      // 1. Cập nhật và Reset trạng thái thói quen
-      await _processHabitsForNewDay(isConsecutiveDay);
-
-      // 2. Gọi callback để cập nhật lại giao diện UI
-      if (onNewDayDetected != null) {
-        onNewDayDetected!();
-      }
+      final Future<void> Function()? callback = onNewDayDetected;
+      if (callback != null) await callback();
+    } catch (e, s) {
+      debugPrint('checkAndProcessNewDay lỗi: $e\n$s');
+    } finally {
+      _running = false;
     }
-
-    // Cập nhật lại ngày hoạt động gần nhất
-    await prefs.setString('last_active_date', todayStr);
   }
 
   String _getDateString(DateTime date) {
     return "${date.year}-${date.month.toString().padLeft(2, '0')}-${date.day.toString().padLeft(2, '0')}";
-  }
-
-  Future<void> _processHabitsForNewDay(bool isConsecutiveDay) async {
-    final prefs = await SharedPreferences.getInstance();
-    final String? habitsString = prefs.getString('saved_habits');
-
-    if (habitsString != null) {
-      final List decoded = jsonDecode(habitsString);
-      List<Habit> habits = decoded.map((item) => Habit.fromMap(item)).toList();
-
-      for (var habit in habits) {
-        if (!habit.isCompletedToday) {
-          // Nếu ngày hôm trước chưa hoàn thành -> Reset streak về 0
-          habit.streak = 0;
-        }
-        // Đặt lại trạng thái chưa hoàn thành cho ngày hôm nay
-        habit.isCompletedToday = false;
-      }
-
-      // Lưu lại danh sách thói quen đã được reset vào SharedPreferences
-      final habitsEncoded = jsonEncode(habits.map((h) => h.toMap()).toList());
-      await prefs.setString('saved_habits', habitsEncoded);
-      debugPrint('Đã tự động reset trạng thái thói quen cho ngày mới!');
-    }
   }
 }
