@@ -54,7 +54,8 @@ class Task {
   String? reminderTime;
   List<Tag> tags;
   String status;
-  String themeType; // Thêm phân loại chủ đề: 'game', 'sport', 'study', 'default'
+  String
+  themeType; // Thêm phân loại chủ đề: 'game', 'sport', 'study', 'default'
   DateTime? eventTargetTime; // Thời gian đích để đếm ngược (nếu có)
   String? customBackgroundImage; // URL ảnh động / GIF nền tùy chỉnh
 

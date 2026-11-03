@@ -3,6 +3,7 @@ import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:timezone/data/latest.dart' as tz_data;
 import 'package:timezone/timezone.dart' as tz;
 
+import '../models/reminder_payload.dart';
 import '../models/task_habit_model.dart';
 
 /// Số phút báo trước khi tới giờ làm việc (giống đồng hồ hẹn giờ).
@@ -24,10 +25,18 @@ class NotificationService {
   bool _timezoneReady = false;
   bool _canUseExactAlarm = true;
 
+  /// Được gọi khi người dùng chạm thông báo, hoặc khi thông báo toàn khung
+  /// tự mở app lúc tới giờ. Màn hình chính gán callback này.
+  void Function(ReminderPayload payload)? onReminderOpened;
+
+  /// Payload đến trước khi UI kịp gắn callback (app đang bị tắt hẳn).
+  ReminderPayload? _pendingPayload;
+
   AndroidFlutterLocalNotificationsPlugin? get _android =>
       flutterLocalNotificationsPlugin
           .resolvePlatformSpecificImplementation<
-              AndroidFlutterLocalNotificationsPlugin>();
+            AndroidFlutterLocalNotificationsPlugin
+          >();
 
   Future<void> init() async {
     if (_ready) return;
@@ -40,7 +49,10 @@ class NotificationService {
       const InitializationSettings initializationSettings =
           InitializationSettings(android: initializationSettingsAndroid);
 
-      await flutterLocalNotificationsPlugin.initialize(initializationSettings);
+      await flutterLocalNotificationsPlugin.initialize(
+        initializationSettings,
+        onDidReceiveNotificationResponse: _handleResponse,
+      );
 
       // Tạo sẵn channel để thông báo hiển thị được trên Android 8+
       await _android?.createNotificationChannel(
@@ -54,6 +66,10 @@ class NotificationService {
 
       // Android 13+ bắt buộc xin quyền POST_NOTIFICATIONS mới hiện được thông báo
       await _android?.requestNotificationsPermission();
+
+      // Android 14+ cần quyền riêng để thông báo được mở màn hình toàn khung
+      // đè lên màn hình khóa (giống app báo thức).
+      await _android?.requestFullScreenIntentPermission();
 
       // Android 12+ cần quyền hẹn báo thức chính xác để báo đúng phút
       final bool canExact =
@@ -160,15 +176,64 @@ class NotificationService {
   /// slot 0 = báo trước 15 phút, slot 1 = báo đúng giờ
   int _notificationId(String rawId, int slot) => _stableHash(rawId) * 4 + slot;
 
-  NotificationDetails get _details => const NotificationDetails(
+  /// [fullScreen] = true thì Android sẽ mở thẳng app ở chế độ toàn khung đè
+  /// lên màn hình khóa khi tới giờ, thay vì chỉ hiện một dòng thông báo.
+  NotificationDetails _detailsFor({required bool fullScreen}) =>
+      NotificationDetails(
         android: AndroidNotificationDetails(
           _channelId,
           _channelName,
           channelDescription: _channelDesc,
           importance: Importance.max,
           priority: Priority.high,
+          category: AndroidNotificationCategory.alarm,
+          // Hiện đầy đủ nội dung trên màn hình khóa
+          visibility: NotificationVisibility.public,
+          fullScreenIntent: fullScreen,
         ),
       );
+
+  // ===========================================================================
+  // MỞ MÀN HÌNH NHẮC KHI CHẠM / KHI TỚI GIỜ
+  // ===========================================================================
+
+  void _handleResponse(NotificationResponse response) {
+    final payload = ReminderPayload.parse(response.payload);
+    if (payload == null) return;
+    final handler = onReminderOpened;
+    if (handler != null) {
+      handler(payload);
+    } else {
+      // UI chưa sẵn sàng (app vừa được thông báo đánh thức) -> giữ lại
+      _pendingPayload = payload;
+    }
+  }
+
+  /// Gọi sau khi UI đã gắn [onReminderOpened]: xử lý thông báo đã mở app
+  /// lúc app còn đang tắt, và payload đến sớm hơn UI.
+  Future<void> handleLaunchFromNotification() async {
+    final handler = onReminderOpened;
+    if (handler == null) return;
+
+    final pending = _pendingPayload;
+    if (pending != null) {
+      _pendingPayload = null;
+      handler(pending);
+      return;
+    }
+
+    try {
+      final details = await flutterLocalNotificationsPlugin
+          .getNotificationAppLaunchDetails();
+      if (details == null || !details.didNotificationLaunchApp) return;
+      final payload = ReminderPayload.parse(
+        details.notificationResponse?.payload,
+      );
+      if (payload != null) handler(payload);
+    } catch (e) {
+      debugPrint('Không đọc được thông tin thông báo mở app: $e');
+    }
+  }
 
   // ===========================================================================
   // ĐỒNG BỘ TOÀN BỘ LỊCH NHẮC
@@ -213,7 +278,7 @@ class NotificationService {
       when: target.subtract(const Duration(minutes: kReminderLeadMinutes)),
       title: '⏰ Còn $kReminderLeadMinutes phút nữa',
       body: '${task.title} sẽ bắt đầu lúc ${_fmt(time)}. Chuẩn bị nhé!',
-      payload: 'task:${task.id}',
+      payload: ReminderPayload(kind: 'task', id: task.id, isLead: true),
     );
 
     // Báo đúng giờ bắt đầu
@@ -222,7 +287,7 @@ class NotificationService {
       when: target,
       title: '🔔 Đã tới giờ làm việc',
       body: '${task.title} bắt đầu ngay bây giờ (${_fmt(time)}).',
-      payload: 'task:${task.id}',
+      payload: ReminderPayload(kind: 'task', id: task.id, isLead: false),
     );
   }
 
@@ -236,7 +301,7 @@ class NotificationService {
       time: _shiftBack(time, kReminderLeadMinutes),
       title: '⏰ Còn $kReminderLeadMinutes phút nữa',
       body: '${habit.title} sẽ bắt đầu lúc ${_fmt(time)}.',
-      payload: 'habit:${habit.id}',
+      payload: ReminderPayload(kind: 'habit', id: habit.id, isLead: true),
     );
 
     await _scheduleDaily(
@@ -244,7 +309,7 @@ class NotificationService {
       time: time,
       title: '🔥 Tới giờ giữ chuỗi thói quen',
       body: '${habit.title} - chuỗi hiện tại ${habit.streak} ngày.',
-      payload: 'habit:${habit.id}',
+      payload: ReminderPayload(kind: 'habit', id: habit.id, isLead: false),
     );
   }
 
@@ -253,7 +318,7 @@ class NotificationService {
     required DateTime when,
     required String title,
     required String body,
-    String? payload,
+    required ReminderPayload payload,
   }) async {
     // Bỏ qua mốc đã trôi qua
     if (!when.isAfter(DateTime.now())) return;
@@ -272,7 +337,7 @@ class NotificationService {
     required TimeOfDayValue time,
     required String title,
     required String body,
-    String? payload,
+    required ReminderPayload payload,
   }) async {
     await _zonedSchedule(
       id: id,
@@ -289,22 +354,26 @@ class NotificationService {
     required tz.TZDateTime scheduled,
     required String title,
     required String body,
-    String? payload,
+    required ReminderPayload payload,
     DateTimeComponents? matchDateTimeComponents,
   }) async {
+    // Mọi nhắc nhở đều mở màn hình toàn khung với ảnh nền của card
+    final NotificationDetails details = _detailsFor(fullScreen: true);
+    final String encoded = payload.encode();
+
     try {
       await flutterLocalNotificationsPlugin.zonedSchedule(
         id,
         title,
         body,
         scheduled,
-        _details,
+        details,
         androidScheduleMode: _canUseExactAlarm
             ? AndroidScheduleMode.exactAllowWhileIdle
             : AndroidScheduleMode.inexactAllowWhileIdle,
         uiLocalNotificationDateInterpretation:
             UILocalNotificationDateInterpretation.absoluteTime,
-        payload: payload,
+        payload: encoded,
         matchDateTimeComponents: matchDateTimeComponents,
       );
     } catch (e) {
@@ -317,11 +386,11 @@ class NotificationService {
           title,
           body,
           scheduled,
-          _details,
+          details,
           androidScheduleMode: AndroidScheduleMode.inexactAllowWhileIdle,
           uiLocalNotificationDateInterpretation:
               UILocalNotificationDateInterpretation.absoluteTime,
-          payload: payload,
+          payload: encoded,
           matchDateTimeComponents: matchDateTimeComponents,
         );
       } catch (e2) {
@@ -377,7 +446,12 @@ class NotificationService {
   }) async {
     if (!_ready) await init();
     try {
-      await flutterLocalNotificationsPlugin.show(id, title, body, _details);
+      await flutterLocalNotificationsPlugin.show(
+        id,
+        title,
+        body,
+        _detailsFor(fullScreen: false),
+      );
     } catch (e) {
       debugPrint('Không hiện được thông báo: $e');
     }
@@ -386,7 +460,8 @@ class NotificationService {
   /// Danh sách thông báo đang chờ - hữu ích khi cần kiểm tra lịch đã đặt.
   Future<List<PendingNotificationRequest>> pending() async {
     try {
-      return await flutterLocalNotificationsPlugin.pendingNotificationRequests();
+      return await flutterLocalNotificationsPlugin
+          .pendingNotificationRequests();
     } catch (e) {
       debugPrint('Không đọc được danh sách thông báo chờ: $e');
       return <PendingNotificationRequest>[];
