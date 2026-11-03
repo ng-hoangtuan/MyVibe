@@ -5,15 +5,19 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:intl/intl.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'models/task_habit_model.dart';
 import 'services/day_transition_service.dart';
 import 'services/notification_service.dart';
+import 'services/widget_service.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  DayTransitionService.instance.init();
+  // DayTransitionService được khởi tạo trong HomeScreen.initState để nó có
+  // callback reload UI. Gọi ở cả hai nơi như trước sẽ chạy hai lần song song
+  // và làm hỏng dữ liệu thói quen.
   await NotificationService.instance.init();
   runApp(const TaskHabitApp());
 }
@@ -133,94 +137,186 @@ class _HomeScreenState extends State<HomeScreen> {
 
   bool _isLoading = true;
 
+  /// Chỉ cho phép ghi xuống bộ nhớ SAU khi đã đọc xong dữ liệu cũ.
+  /// Nếu không, một lần lưu xảy ra trong lúc đang đọc sẽ ghi đè dữ liệu thật
+  /// bằng danh sách mặc định -> người dùng thấy "không lưu được / mất dữ liệu".
+  bool _hasLoaded = false;
+
   @override
   void initState() {
     super.initState();
-    _loadDataFromPrefs();
-    DayTransitionService.instance.init(
-      onNewDay: () {
-        if (mounted) _loadDataFromPrefs();
-      },
-    );
+    _bootstrap();
+  }
+
+  Future<void> _bootstrap() async {
+    await _loadDataFromPrefs();
+    // Khởi tạo sau khi đã load để callback chuyển ngày làm việc trên dữ liệu thật
+    await DayTransitionService.instance.init(onNewDay: _handleNewDay);
+    await _syncExternal();
+  }
+
+  @override
+  void dispose() {
+    DayTransitionService.instance.dispose();
+    super.dispose();
+  }
+
+  /// Sang ngày mới: reset trạng thái thói quen trên danh sách đang giữ trong
+  /// bộ nhớ rồi lưu lại một lần duy nhất.
+  Future<void> _handleNewDay() async {
+    if (!mounted) return;
+    setState(() {
+      for (final habit in _habits) {
+        if (!habit.isCompletedToday) {
+          // Hôm trước không hoàn thành -> mất chuỗi
+          habit.streak = 0;
+        }
+        habit.isCompletedToday = false;
+      }
+    });
+    await _persistAndSync(showFeedback: false);
   }
 
   Future<void> _loadDataFromPrefs() async {
-    final prefs = await SharedPreferences.getInstance();
+    try {
+      final prefs = await SharedPreferences.getInstance();
 
-    final String? tasksString = prefs.getString('saved_tasks');
-    if (tasksString != null) {
-      _tasks = (jsonDecode(tasksString) as List)
-          .map((item) => Task.fromMap(item))
-          .toList();
-    } else {
-      _tasks = [
-        Task(
-          id: '1',
-          title: 'Săn Behemoth & Mở cổng 4',
-          dueDate: DateTime.now(),
-          reminderTime: '20:00',
-          tags: [_availableTags[0]],
-          themeType: 'game',
-        ),
-      ];
+      _tasks = _decodeList<Task>(
+        prefs.getString('saved_tasks'),
+        (map) => Task.fromMap(map),
+        fallback: () => [
+          Task(
+            id: '1',
+            title: 'Săn Behemoth & Mở cổng 4',
+            dueDate: DateTime.now(),
+            reminderTime: '20:00',
+            tags: [_availableTags[0]],
+            themeType: 'game',
+          ),
+        ],
+      );
+
+      _habits = _decodeList<Habit>(
+        prefs.getString('saved_habits'),
+        (map) => Habit.fromMap(map),
+        fallback: () => [
+          Habit(
+            id: 'h1',
+            title: 'Đánh cầu lông 30 phút',
+            streak: 3,
+            reminderTime: '17:30',
+            tags: [_availableTags[1]],
+            themeType: 'sport',
+          ),
+        ],
+      );
+
+      final loadedTags = _decodeList<Tag>(
+        prefs.getString('saved_tags'),
+        (map) => Tag.fromMap(map),
+        fallback: () => _availableTags,
+      );
+      // Không bao giờ để danh sách nhãn rỗng, UI đang dùng _availableTags[0]
+      if (loadedTags.isNotEmpty) _availableTags = loadedTags;
+
+      _bgLibrary = _decodeList<BackgroundItem>(
+        prefs.getString('saved_bg_library'),
+        (map) => BackgroundItem.fromMap(map),
+        fallback: () => List.from(_defaultBgLibrary),
+      );
+    } catch (e, s) {
+      debugPrint('Không đọc được dữ liệu đã lưu: $e\n$s');
+    } finally {
+      // Luôn mở khoá để app không bị treo ở vòng xoay loading
+      _hasLoaded = true;
+      if (mounted) {
+        setState(() => _isLoading = false);
+      } else {
+        _isLoading = false;
+      }
     }
-
-    final String? habitsString = prefs.getString('saved_habits');
-    if (habitsString != null) {
-      _habits = (jsonDecode(habitsString) as List)
-          .map((item) => Habit.fromMap(item))
-          .toList();
-    } else {
-      _habits = [
-        Habit(
-          id: 'h1',
-          title: 'Đánh cầu lông 30 phút',
-          streak: 3,
-          reminderTime: '17:30',
-          tags: [_availableTags[1]],
-          themeType: 'sport',
-        ),
-      ];
-    }
-
-    final String? tagsString = prefs.getString('saved_tags');
-    if (tagsString != null) {
-      _availableTags = (jsonDecode(tagsString) as List)
-          .map((item) => Tag.fromMap(item))
-          .toList();
-    }
-
-    final String? bgString = prefs.getString('saved_bg_library');
-    if (bgString != null) {
-      final List decoded = jsonDecode(bgString);
-      _bgLibrary = decoded.map((item) => BackgroundItem.fromMap(item)).toList();
-    } else {
-      _bgLibrary = List.from(_defaultBgLibrary);
-    }
-
-    setState(() {
-      _isLoading = false;
-    });
   }
 
-  Future<void> _saveDataToPrefs() async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(
-      'saved_tasks',
-      jsonEncode(_tasks.map((t) => t.toMap()).toList()),
-    );
-    await prefs.setString(
-      'saved_habits',
-      jsonEncode(_habits.map((h) => h.toMap()).toList()),
-    );
-    await prefs.setString(
-      'saved_tags',
-      jsonEncode(_availableTags.map((t) => t.toMap()).toList()),
-    );
-    await prefs.setString(
-      'saved_bg_library',
-      jsonEncode(_bgLibrary.map((b) => b.toMap()).toList()),
-    );
+  /// Giải mã danh sách JSON, bỏ qua từng bản ghi lỗi thay vì làm hỏng cả danh sách.
+  List<T> _decodeList<T>(
+    String? raw,
+    T Function(Map<String, dynamic>) fromMap, {
+    required List<T> Function() fallback,
+  }) {
+    if (raw == null || raw.trim().isEmpty) return fallback();
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is! List) return fallback();
+      final result = <T>[];
+      for (final item in decoded) {
+        try {
+          if (item is Map) {
+            result.add(fromMap(Map<String, dynamic>.from(item)));
+          }
+        } catch (e) {
+          debugPrint('Bỏ qua 1 bản ghi lỗi khi đọc dữ liệu: $e');
+        }
+      }
+      return result;
+    } catch (e) {
+      debugPrint('JSON đã lưu bị lỗi, dùng dữ liệu mặc định: $e');
+      return fallback();
+    }
+  }
+
+  Future<bool> _saveDataToPrefs() async {
+    // Chưa load xong thì không ghi, tránh ghi đè mất dữ liệu cũ
+    if (!_hasLoaded) {
+      debugPrint('Bỏ qua lần lưu này vì chưa đọc xong dữ liệu cũ.');
+      return false;
+    }
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(
+        'saved_tasks',
+        jsonEncode(_tasks.map((t) => t.toMap()).toList()),
+      );
+      await prefs.setString(
+        'saved_habits',
+        jsonEncode(_habits.map((h) => h.toMap()).toList()),
+      );
+      await prefs.setString(
+        'saved_tags',
+        jsonEncode(_availableTags.map((t) => t.toMap()).toList()),
+      );
+      await prefs.setString(
+        'saved_bg_library',
+        jsonEncode(_bgLibrary.map((b) => b.toMap()).toList()),
+      );
+      return true;
+    } catch (e, s) {
+      debugPrint('LƯU DỮ LIỆU THẤT BẠI: $e\n$s');
+      return false;
+    }
+  }
+
+  /// Lưu xuống bộ nhớ, rồi đồng bộ widget ngoài màn hình chính và đặt lại
+  /// toàn bộ lịch thông báo nhắc nhở.
+  Future<void> _persistAndSync({bool showFeedback = true}) async {
+    final bool ok = await _saveDataToPrefs();
+    if (!ok) {
+      if (mounted && showFeedback) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Lưu dữ liệu thất bại, vui lòng thử lại.'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+      return;
+    }
+    await _syncExternal();
+  }
+
+  /// Đẩy dữ liệu ra widget + đặt lại lịch nhắc nhở.
+  Future<void> _syncExternal() async {
+    await WidgetService.instance.sync(_tasks, _habits);
+    await NotificationService.instance.syncAll(_tasks, _habits);
   }
 
   /// Tải ảnh cục bộ từ thiết bị qua image_picker (hỗ trợ cả Web & Mobile)
@@ -239,11 +335,40 @@ class _HomeScreenState extends State<HomeScreen> {
           final base64String = 'data:image/png;base64,${base64Encode(bytes)}';
           onImagePicked(base64String);
         } else {
-          onImagePicked(pickedFile.path);
+          // image_picker trả về file nằm trong thư mục cache, Android có thể
+          // dọn bất cứ lúc nào -> phải copy sang thư mục riêng của app,
+          // nếu không ảnh nền sẽ biến mất sau khi khởi động lại.
+          final savedPath = await _copyImageToAppStorage(pickedFile);
+          onImagePicked(savedPath ?? pickedFile.path);
         }
       }
     } catch (e) {
       debugPrint('Lỗi chọn ảnh từ thiết bị: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Không lấy được ảnh từ thiết bị.')),
+        );
+      }
+    }
+  }
+
+  /// Copy ảnh vừa chọn vào thư mục dữ liệu của app để giữ được lâu dài.
+  Future<String?> _copyImageToAppStorage(XFile picked) async {
+    try {
+      final docsDir = await getApplicationDocumentsDirectory();
+      final bgDir = Directory('${docsDir.path}/card_backgrounds');
+      if (!await bgDir.exists()) {
+        await bgDir.create(recursive: true);
+      }
+      final name = picked.name;
+      final ext = name.contains('.') ? name.split('.').last : 'jpg';
+      final dest =
+          '${bgDir.path}/bg_${DateTime.now().millisecondsSinceEpoch}.$ext';
+      await File(picked.path).copy(dest);
+      return dest;
+    } catch (e) {
+      debugPrint('Không copy được ảnh vào bộ nhớ app: $e');
+      return null;
     }
   }
 
@@ -339,7 +464,7 @@ class _HomeScreenState extends State<HomeScreen> {
                         colorValue: selectedColor,
                       );
                       setState(() => _availableTags.add(newTag));
-                      _saveDataToPrefs();
+                      _persistAndSync();
                       onTagCreated(newTag);
                       Navigator.pop(context);
                     }
@@ -530,7 +655,7 @@ class _HomeScreenState extends State<HomeScreen> {
                                               _bgLibrary.removeAt(index);
                                             });
                                             setState(() {});
-                                            _saveDataToPrefs();
+                                            _persistAndSync();
                                           },
                                         ),
                                       ),
@@ -676,7 +801,7 @@ class _HomeScreenState extends State<HomeScreen> {
                         category: category,
                       );
                       _bgLibrary.add(newItem);
-                      _saveDataToPrefs();
+                      _persistAndSync();
                       onAdded();
                       Navigator.pop(dialogContext);
                     }
@@ -723,6 +848,9 @@ class _HomeScreenState extends State<HomeScreen> {
             : (_availableTags.isNotEmpty ? _availableTags.first : null));
 
     final titleController = TextEditingController(text: title);
+    // Lấy messenger từ context của State. Bên trong dialog, biến `context` bị
+    // StatefulBuilder che mất và sẽ không dùng được nữa sau khi dialog đóng.
+    final messenger = ScaffoldMessenger.of(context);
 
     showDialog(
       context: context,
@@ -1174,7 +1302,7 @@ class _HomeScreenState extends State<HomeScreen> {
                     backgroundColor: Colors.deepPurple,
                     foregroundColor: Colors.white,
                   ),
-                  onPressed: () {
+                  onPressed: () async {
                     final currentTitle = titleController.text.trim().isNotEmpty
                         ? titleController.text.trim()
                         : title.trim();
@@ -1236,8 +1364,24 @@ class _HomeScreenState extends State<HomeScreen> {
                           }
                         }
                       });
-                      _saveDataToPrefs();
                       Navigator.pop(dialogContext);
+
+                      final bool saved = await _saveDataToPrefs();
+                      messenger.showSnackBar(
+                        SnackBar(
+                          duration: const Duration(seconds: 2),
+                          backgroundColor:
+                              saved ? Colors.green.shade700 : Colors.red,
+                          content: Text(
+                            saved
+                                ? (isEditing
+                                    ? 'Đã lưu thay đổi ✅'
+                                    : 'Đã tạo công việc mới ✅')
+                                : 'Lưu dữ liệu thất bại, vui lòng thử lại.',
+                          ),
+                        ),
+                      );
+                      if (saved) await _syncExternal();
                     }
                   },
                   child: Text(isEditing ? 'Lưu' : 'Tạo mới'),
@@ -1748,7 +1892,7 @@ class _HomeScreenState extends State<HomeScreen> {
                           ),
                           onDismissed: (_) {
                             setState(() => _habits.remove(habit));
-                            _saveDataToPrefs();
+                            _persistAndSync();
                           },
                           child: buildThemedCard(
                             title: habit.title,
@@ -1770,7 +1914,7 @@ class _HomeScreenState extends State<HomeScreen> {
                                       : 0;
                                 }
                               });
-                              _saveDataToPrefs();
+                              _persistAndSync();
                             },
                             onUndo: () {
                               setState(() {
@@ -1779,7 +1923,7 @@ class _HomeScreenState extends State<HomeScreen> {
                                     ? habit.streak - 1
                                     : 0;
                               });
-                              _saveDataToPrefs();
+                              _persistAndSync();
                             },
                             onEdit: () => _showItemDialog(habitToEdit: habit),
                           ),
@@ -1835,7 +1979,7 @@ class _HomeScreenState extends State<HomeScreen> {
                           ),
                           onDismissed: (_) {
                             setState(() => _tasks.remove(task));
-                            _saveDataToPrefs();
+                            _persistAndSync();
                           },
                           child: buildThemedCard(
                             title: task.title,
@@ -1851,11 +1995,11 @@ class _HomeScreenState extends State<HomeScreen> {
                               setState(
                                 () => task.isCompleted = !task.isCompleted,
                               );
-                              _saveDataToPrefs();
+                              _persistAndSync();
                             },
                             onUndo: () {
                               setState(() => task.isCompleted = false);
-                              _saveDataToPrefs();
+                              _persistAndSync();
                             },
                             onEdit: () => _showItemDialog(taskToEdit: task),
                           ),

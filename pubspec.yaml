@@ -17,6 +17,10 @@ dependencies:
   home_widget: ^0.7.0
   lottie: ^3.1.2
   image_picker: ^1.0.7
+  # Cần cho zonedSchedule (hẹn thông báo theo múi giờ)
+  timezone: ^0.9.4
+  # Cần để copy ảnh nền vào thư mục dữ liệu lâu dài của app
+  path_provider: ^2.1.4
 
 dev_dependencies:
   flutter_test:
